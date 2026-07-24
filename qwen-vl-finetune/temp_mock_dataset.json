@@ -1,0 +1,1 @@
+[{"id": "eval_001", "video": "/iris/projects/humanoid/trossen_data/0528_green_block_mem_copy/videos/chunk-000/observation.images.cam_high/h264_videos/episode_000000.mp4", "conversations": [{"from": "human", "value": "<video>\nWhat action should the robot take next?"}, {"from": "gpt", "value": "pick up green block"}]}]

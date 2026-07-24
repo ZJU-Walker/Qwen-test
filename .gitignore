@@ -1,0 +1,8 @@
+checkpoints/
+inference_outputs/
+inference_sliding_window.mp4
+qwen-vl-finetune/checkpoints/
+qwen-vl-finetune/qwenvl/data/__pycache__/
+qwen-vl-finetune/qwenvl/train/__pycache__/
+qwen-vl-finetune/wandb/
+qwen_cache/
