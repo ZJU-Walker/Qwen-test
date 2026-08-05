@@ -51,6 +51,21 @@ def _make_abs_paths(base: Path, files: str) -> str:
 
 
 def update_processor_pixels(processor, data_args):
+    """Force our own visual budgets onto the HF processor.
+
+    IMPORTANT, and easy to miss: `size["shortest_edge"]` / `size["longest_edge"]` do NOT
+    hold edge lengths here -- Qwen3-VL stores PIXEL AREAS in them. See
+    video_processing_qwen3_vl.py:207-208, which passes them straight into smart_resize as
+    `min_pixels` / `max_pixels`.
+
+    Consequence worth knowing: the assignments below REPLACE the floors Qwen ships. Stock
+    Qwen3-VL-4B-Instruct declares an image floor of 65,536 px (= 64 tokens at 1024 px/token)
+    and would UPSCALE anything smaller; we overwrite it with --min_pixels (default 12,544 px
+    ~= 12 tokens), so nothing is ever upscaled and no floor is enforced. The video path has
+    no meaningful floor either way (Qwen's own is 4,096 px = ~2 tokens for a whole clip).
+
+    `python scripts/trace_image_pipeline.py` prints all of this live, stage by stage.
+    """
     logger = logging.getLogger(__name__)
 
     # --- Image Processor ---

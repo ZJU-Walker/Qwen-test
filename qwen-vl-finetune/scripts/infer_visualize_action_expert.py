@@ -48,9 +48,12 @@ from qwenvl.action_expert.inference import (
     build_dataset,
     generate_subtask,
     load_model,
+    load_norm_stats_path,
+    load_visual_budget,
     make_prompt,
     predict_expert,
     predict_fast,
+    subtask_token_mask_for,
     templatize,
 )
 
@@ -125,7 +128,7 @@ def main():
     ap.add_argument("--data_dirs", default=DATA_DIRS,
                     help="dataset dir(s) for norm stats + episodes; MUST match the checkpoint's training data")
     ap.add_argument("--num_flow_steps", type=int, default=10)
-    ap.add_argument("--max_fast_new_tokens", type=int, default=96)
+    ap.add_argument("--max_fast_new_tokens", type=int, default=160)  # >= max_fast_len 151 + markers (ee6d artifacts); greedy stops at the end marker earlier
     ap.add_argument("--max_subtask_new_tokens", type=int, default=48)
     ap.add_argument("--teacher_force_subtask", action="store_true",
                     help="condition on the GT subtask instead of the model's own generated subtask")
@@ -134,6 +137,10 @@ def main():
                     help="single current cam_high still instead of the history video")
     ap.add_argument("--subtask_input", action="store_true",
                     help="subtask is the input prompt (predict_subtask=False); no subtask generation")
+    ap.add_argument("--insulated_subtask", action="store_true",
+                    help="checkpoint trained with --expert_attends_subtask False. MUST match training: "
+                         "the expert conditions on images+state only. Without this the expert is wired "
+                         "to attend the subtask turn it never saw in training -> garbage predictions.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0, help="0 = all episodes")
     args = ap.parse_args()
@@ -145,14 +152,23 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    # The pixel budget the checkpoint TRAINED with. Not recoverable from the weights, and a
+    # mismatch silently feeds the model a different resolution than it ever saw.
+    budget = load_visual_budget(args.ckpt)
+    print(f"[visual budget] {budget or 'not recorded -> legacy defaults (33 tok/frame)'}")
+
+    norm_stats_path = load_norm_stats_path(args.ckpt)
+    print(f"[norm stats] {norm_stats_path or 'not stamped in ckpt -> tokenizer-dir/dataset-dir fallback'}")
+
     print("Loading dataset (registers FAST tokens, loads norm stats)...")
     ds = build_dataset(args.fast_tok, data_dirs=args.data_dirs, image_history=not args.no_image_history,
-                       predict_subtask=not args.subtask_input)
+                       predict_subtask=not args.subtask_input, budget=budget,
+                       norm_stats_path=norm_stats_path)
     print(f"  episodes={len(ds)}  vlm_vocab={ds.vlm_vocab_size}  "
           f"fast[start={ds.fast_start_id} end={ds.fast_end_id} base={ds.fast_base_id} V={ds.fast_vocab_size}]")
 
     print(f"Loading model from {args.ckpt} ...")
-    model = load_model(args.ckpt, ds, device)
+    model = load_model(args.ckpt, ds, device, expert_attends_subtask=not args.insulated_subtask)
 
     im_end_id = ds.tokenizer.convert_tokens_to_ids("<|im_end|>")
     t_rng = random.Random(args.seed)  # reproducible per-episode timestep choice
@@ -174,7 +190,13 @@ def main():
                 #    assistant turn, no generation.
                 #  - predict-subtask: the model generates it (or teacher-force with GT), and it
                 #    becomes the assistant turn both action heads condition on.
-                if not ds.data_args.predict_subtask:
+                if args.insulated_subtask:
+                    # The expert never sees the subtask turn (training semantics), so serve the
+                    # generation-prompt sequence and mask the dangling assistant header -- exactly
+                    # what the server's --insulated_subtask skip path does.
+                    pred_subtask = "(not decoded; expert is subtask-insulated)"
+                    mm = templatize(ds, top, wrist, prompt, None, device)
+                elif not ds.data_args.predict_subtask:
                     pred_subtask = gt_subtask  # the input subtask (hard-coded at deploy)
                     mm = templatize(ds, top, wrist, prompt, None, device)
                 elif args.teacher_force_subtask:
@@ -190,7 +212,9 @@ def main():
                     (1, ACTION_HORIZON, ACTION_DIM), device=device, dtype=torch.float32,
                     generator=torch.Generator(device=device).manual_seed(args.seed + idx),
                 )
-                expert = predict_expert(model, mm, ds, state, noise, args.num_flow_steps)
+                stask_mask = subtask_token_mask_for(mm["input_ids"]) if args.insulated_subtask else None
+                expert = predict_expert(model, mm, ds, state, noise, args.num_flow_steps,
+                                        subtask_token_mask=stask_mask)
                 fast, (n_gen, n_valid, exact) = predict_fast(model, mm, ds, state, args.max_fast_new_tokens)
                 gt = gt_chunk(episode, t, ACTION_HORIZON)
 

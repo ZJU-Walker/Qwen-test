@@ -4,10 +4,12 @@ knowledge insulation: expert gradients never touch the VLM weights).
 Launch with scripts/train_action_expert_4b.sh.
 """
 
+import json
 import logging
 import os
 import pathlib
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -74,6 +76,9 @@ class ActionExpertModelArguments:
     # new regime -- e.g. more GPUs / a larger batch -- from an existing checkpoint. Point
     # --output_dir at a NEW empty dir so auto-resume does not also kick in.
     init_from: str = field(default="")
+    # EMA of the expert (non-vlm) weights, deployed at inference like openpi/Diffusion
+    # Policy do (see ExpertEMACallback). 0.99 ~= 100-step average. 0 = off.
+    ema_decay: float = field(default=0.99)
 
 
 def rank0_print(*args):
@@ -100,12 +105,23 @@ class ActionExpertTrainer(Trainer):
                 p for n, p in self.model.named_parameters()
                 if p.requires_grad and n.startswith("vlm.")
             ]
-            groups = [{"params": expert_params, "lr": self.args.learning_rate}]
+            # weight_decay MUST be set explicitly on each group: torch fills any missing
+            # param-group option from the optimizer's constructor defaults, and AdamW's
+            # default is 0.01 -- which silently overrode --weight_decay 0 here for months
+            # (found in the 2026-07-28 optimizer audit). openpi uses ~0 (1e-10); Qwen's own
+            # SFT uses 0 via the stock Trainer, which wires this field correctly.
+            wd = self.args.weight_decay
+            groups = [{"params": expert_params, "lr": self.args.learning_rate, "weight_decay": wd}]
             if vlm_params:
-                groups.append({"params": vlm_params, "lr": self.vlm_learning_rate})
+                groups.append({"params": vlm_params, "lr": self.vlm_learning_rate, "weight_decay": wd})
             optim_cls, optim_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
             optim_kwargs.pop("lr", None)
+            optim_kwargs.pop("weight_decay", None)  # per-group above; don't let kwargs fight it
             self.optimizer = optim_cls(groups, **optim_kwargs)
+            rank0_print(f"[optimizer] {optim_cls.__name__}  betas={optim_kwargs.get('betas')}  "
+                        f"weight_decay={wd} (both groups)  "
+                        f"expert lr {self.args.learning_rate} ({len(expert_params)} tensors), "
+                        f"vlm lr {self.vlm_learning_rate} ({len(vlm_params)} tensors)")
         return self.optimizer
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -127,6 +143,79 @@ class ActionExpertTrainer(Trainer):
         return super().log(logs, start_time)
 
 
+class ExpertEMACallback(transformers.TrainerCallback):
+    """EMA (exponential moving average) of the from-scratch parameters -- the expert
+    transformer + flow heads (everything not prefixed 'vlm.').
+
+    Every working flow/diffusion policy stack DEPLOYS an averaged copy of the weights,
+    not the raw optimizer iterate: openpi saves state.ema_params as the checkpoint
+    'params' the policy server loads (checkpoints.py:145-151, ema_decay=0.99 default);
+    Diffusion Policy evaluates its ema_model. The average sits near the center of the
+    orbit the weights trace around the loss minimum, so the served policy loses the
+    iterate noise that shows up as flickery action chunks (measured here as 5-10% of
+    motion range across noise seeds on a mid-training raw checkpoint).
+
+    shadow = decay*shadow + (1-decay)*param after every optimizer step (decay 0.99 ~=
+    a 100-step average), fp32, on the params' device, RANK 0 ONLY (ZeRO-2 replicates
+    module params across ranks, so rank 0 sees the full weights). Saved as
+    `ema_expert.pt` inside each checkpoint dir; inference.load_model overlays it
+    automatically when present. The VLM group is excluded: at lr 1e-5 it barely moves,
+    and its shadow would cost ~16 GB vs ~3 GB for the expert."""
+
+    def __init__(self, model, decay: float = 0.99):
+        self.decay = decay
+        self.model = model
+        self._is_rank0 = int(os.environ.get("RANK", 0)) == 0
+        self._tracked = None
+        self.shadow = None  # deferred: see _ensure_shadow
+
+    @torch.no_grad()
+    def _ensure_shadow(self):
+        """Snapshot the shadow AFTER the Trainer/DeepSpeed has moved the model to its
+        device. At callback-construction time the model is still on CPU (train() does the
+        move), so an eager snapshot leaves a CPU shadow fighting CUDA params -- the exact
+        crash this replaces. Param objects keep their identity through .to()/DS wrapping,
+        so snapshotting lazily gets device-correct tensors from the same references."""
+        self._tracked = [(n, p) for n, p in self.model.named_parameters()
+                         if p.requires_grad and not n.startswith("vlm.")]
+        self.shadow = {n: p.detach().float().clone() for n, p in self._tracked}
+        n_params = sum(v.numel() for v in self.shadow.values())
+        dev = next(iter(self.shadow.values())).device
+        rank0_print(f"[ema] tracking {len(self.shadow)} tensors ({n_params/1e6:.0f}M params) "
+                    f"on {dev}, decay={self.decay} (~{1/(1-self.decay):.0f}-step average), "
+                    f"fp32 shadow {n_params*4/1e9:.1f} GB")
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        # Model is on-device and (if --init_from) warm-started by now: shadow = step-0 weights.
+        if self._is_rank0 and self.shadow is None:
+            self._ensure_shadow()
+
+    @torch.no_grad()
+    def on_step_end(self, args, state, control, **kwargs):
+        if not self._is_rank0:
+            return
+        if self.shadow is None:  # backstop if on_train_begin was skipped
+            self._ensure_shadow()
+        d = self.decay
+        for n, p in self._tracked:
+            buf = self.shadow[n]
+            if buf.device != p.device:  # e.g. model moved after snapshot; realign once
+                buf = self.shadow[n] = buf.to(p.device)
+            buf.mul_(d).add_(p.detach().float(), alpha=1.0 - d)
+
+    def on_save(self, args, state, control, **kwargs):
+        if not self._is_rank0 or self.shadow is None:
+            return
+        ckpt = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if os.path.isdir(ckpt):
+            torch.save(
+                {"decay": self.decay, "step": state.global_step,
+                 "params": {k: v.cpu() for k, v in self.shadow.items()}},
+                os.path.join(ckpt, "ema_expert.pt"),
+            )
+            rank0_print(f"[ema] saved ema_expert.pt @ step {state.global_step}")
+
+
 def set_vlm_trainable(model_args, vlm):
     vlm.visual.requires_grad_(model_args.tune_mm_vision)
     vlm.visual.merger.requires_grad_(model_args.tune_mm_mlp)
@@ -144,6 +233,16 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa: SLF001
+
+
+def atomic_json_dump(obj, path: str):
+    """Serving may read these stamps while a preempted run relaunches -- a bare
+    open(w)+dump exposes a truncated file for the write duration (and forever, after a
+    kill mid-write). mkstemp + os.replace makes the swap atomic."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
 
 
 def save_expert_only(model: Qwen3VLWithActionExpert, output_dir: str):
@@ -165,6 +264,29 @@ def train(attn_implementation="flash_attention_2"):
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     os.makedirs(training_args.output_dir, exist_ok=True)
+
+    # Record the visual budget alongside the checkpoint. Serving MUST feed the model the same
+    # resolution it trained on -- these budgets are not recoverable from the weights, and a
+    # mismatch degrades the policy silently (no shape error: fewer/more visual tokens is
+    # perfectly legal). qwenvl/action_expert/inference.py reads this file back at serve time.
+    if int(os.environ.get("RANK", 0)) == 0:
+        atomic_json_dump({**{k: getattr(data_args, k) for k in (
+            "video_max_pixels", "video_min_pixels", "max_pixels", "min_pixels",
+            "wrist_max_pixels", "num_frames", "frame_stride", "image_history",
+            # Which wrist cameras the model conditions on -- serving a 2-wrist checkpoint
+            # with 1 wrist (or vice versa) would degrade silently otherwise. The serve-side
+            # budget overlay (inference.build_data_args) applies this automatically; old
+            # checkpoints without the key keep the legacy right-wrist default.
+            "wrist_cameras",
+            # Whether the prompt carries the frame-aligned past states ("Past states:") --
+            # an input-shape contract like the above: serving must build the same prompt.
+            "state_history",
+        )},
+            # Whether the expert attended the subtask turn in training. Attention-mask-only
+            # (identical state_dict either way), so a mismatched serve loads cleanly and
+            # degrades silently; the server reads this stamp and auto-applies it.
+            "expert_attends_subtask": model_args.expert_attends_subtask,
+        }, os.path.join(training_args.output_dir, "visual_budget.json"))
 
     if "qwen3" not in model_args.model_name_or_path.lower():
         raise ValueError("The action expert currently supports Qwen3-VL models only")
@@ -266,6 +388,33 @@ def train(attn_implementation="flash_attention_2"):
 
     data_module = make_robot_data_module(processor, data_args)
 
+    # Mixed subtask supervision guards: unlabeled episodes build no assistant turn, so two
+    # otherwise-legal configs become hazardous with them in the mix (2026-08-02 audit).
+    n_unlabeled = sum(1 for ep in data_module["train_dataset"].episodes if not ep["subtasks"])
+    if n_unlabeled and data_args.predict_subtask:
+        rank0_print(f"Mixed subtask supervision: {n_unlabeled}/{len(data_module['train_dataset'].episodes)} "
+                    "episodes unlabeled (no language loss; FAST-only VLM signal)")
+        if model_args.train_vlm and not data_args.use_fast_tokens:
+            raise ValueError(
+                "Mixed data with --train_vlm True needs --use_fast_tokens True: an "
+                "all-unlabeled batch would otherwise give the VLM zero gradient "
+                "(DeepSpeed/DDP hazard, and those samples teach the VLM nothing)."
+            )
+        if model_args.expert_attends_subtask:
+            raise ValueError(
+                "Mixed data requires --expert_attends_subtask False: unlabeled samples "
+                "end in a bare generation header, and a non-insulated expert would train "
+                "attending a dangling header that non-insulated serving (which always "
+                "decodes a subtask) never presents. Insulate, or label the data."
+            )
+
+    # Stamp the resolved norm stats into the output dir (like visual_budget.json above):
+    # serving auto-loads <ckpt>/norm_stats.json so the deployed policy always normalizes
+    # with exactly the stats it trained with, independent of dataset-dir state.
+    if int(os.environ.get("RANK", 0)) == 0:
+        atomic_json_dump(data_module["train_dataset"].norm_stats,
+                         os.path.join(training_args.output_dir, "norm_stats.json"))
+
     if data_args.use_fast_tokens:
         # The dataset registered FAST tokens on processor.tokenizer; grow the VLM's
         # embedding + tied lm_head to match. New rows train from scratch (train_vlm=True).
@@ -303,6 +452,9 @@ def train(attn_implementation="flash_attention_2"):
         vlm_learning_rate=model_args.vlm_learning_rate,
         **data_module,
     )
+    if model_args.ema_decay > 0:
+        # After init_from so the shadow starts from the warm-started weights.
+        trainer.add_callback(ExpertEMACallback(model, decay=model_args.ema_decay))
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         logging.info("checkpoint found, resume training")

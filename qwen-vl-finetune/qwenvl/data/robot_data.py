@@ -19,17 +19,20 @@ import json
 import os
 import random
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.io import read_video
 
+from qwenvl.data.ee_repr import EE_DIM, joints_to_ee
 from qwenvl.data.data_processor import (
     IGNORE_INDEX,
     DataCollatorForSupervisedDataset,
@@ -73,6 +76,36 @@ class RobotDataArguments(DataArguments):
     train_split: float = 0.75
     default_prompt: str = "waiting"
     norm_stats_path: Optional[str] = None
+    # "joint": raw selected joint dims (historic behavior). "ee6d": convert the selected
+    # 7-dim right arm [q0..q5, jaw] to the 10-dim end-effector representation
+    # [xyz, 6D rotation (first two matrix columns), jaw] via forward kinematics at load
+    # time (qwenvl/data/ee_repr.py). Requires action_dim 10 and delta_mask "9,-1"
+    # (position + 6D naive-delta vs state, jaw absolute -- measured valid on this data,
+    # see tests/probe_rotation_smoothness.py).
+    action_space: str = "joint"
+    # Skip episodes shorter than this many frames at scan time (0 = keep all). The 0731
+    # set contains 1-4-frame aborted recordings that would otherwise be sampled as often
+    # as full episodes.
+    min_episode_len: int = 0
+    # pi05-style train-time image augmentation, matched to what pi05 ACTUALLY runs
+    # (openpi model.py preprocess_observation + augmax defaults): RandomCrop to 95% +
+    # resize back + rotation U(-5,5) deg, always on, top-down camera only (history and
+    # no-history stills); color jitter on ALL cameras fires with p=0.5 per camera draw
+    # (augmax ColorJitter default -- pi05 does NOT jitter every image): brightness +
+    # contrast + hue U(-0.1, 0.1). Saturation is omitted on purpose: augmax's saturation
+    # jitter is a no-op (the adjusted value is computed and discarded), so real pi05
+    # checkpoints never trained with it. Wrists get jitter only, like openpi. Parameters
+    # are sampled ONCE per sample per camera and applied to every history frame
+    # identically: a camera-pose/lighting shift is constant within a clip, and per-frame
+    # parameter resampling would inject temporal shake the deployment camera never
+    # produces.
+    image_aug: bool = False
+    image_aug_prob: float = 1.0
+    # Feed the states at the image-history timesteps (all but the newest; its state IS the
+    # current one) into the prompt as "Past states:", frame-aligned and edge-clamped exactly
+    # like the frames (indices max(0, t - k*stride) -- near the episode start the first
+    # state repeats). Input-shape contract: stamped into visual_budget.json; serve must match.
+    state_history: bool = False
     # If True (knowledge-insulation co-training), the user turn asks a fixed question and
     # the assistant turn contains the time-aligned subtask label with LM supervision.
     # If False (default, pi0.5-style), the subtask label IS the prompt and there is no
@@ -128,13 +161,35 @@ def quantile_unnormalize(x: np.ndarray, stats: Dict[str, list]) -> np.ndarray:
     return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
 
-def format_robot_prompt(task: str, normalized_state: np.ndarray) -> str:
-    """pi0.5-style prompt with the discretized state. Must be identical at train/serve time."""
+def _discretize_state(normalized_state: np.ndarray, fixed_width: bool = False) -> str:
+    """fixed_width: zero-pad every bin to 3 digits. Qwen tokenizes digit-by-digit, so
+    plain str() makes the prompt LENGTH depend on the state VALUES -- harmless at 10
+    numbers, but with state history (100 numbers) it swings ~90 tokens and breaks
+    compiled-serving shape stability. State-history checkpoints therefore train and
+    serve fixed-width; legacy checkpoints keep the exact format they trained with."""
     state = np.clip(normalized_state, -1.0, 1.0)
     discretized = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-    state_str = " ".join(map(str, discretized))
+    if fixed_width:
+        return " ".join(f"{v:03d}" for v in discretized)
+    return " ".join(map(str, discretized))
+
+
+def format_robot_prompt(task: str, normalized_state: np.ndarray,
+                        past_states: Optional[np.ndarray] = None) -> str:
+    """pi0.5-style prompt with the discretized state. Must be identical at train/serve time.
+
+    `past_states` (K, D), oldest first: the states at the SAME clamped timesteps as the
+    image-history frames (all but the newest, whose state is the current one). Rendered
+    before the current state so `State:` keeps its trained position next to the action
+    region; each past state is discretized exactly like the current one, ';'-separated."""
     cleaned = task.strip().replace("_", " ").replace("\n", " ")
-    return f"Task: {cleaned}, State: {state_str}"
+    if past_states is not None and len(past_states) > 0:
+        # State-history format is fixed-width throughout (see _discretize_state): the
+        # prompt token count is then CONSTANT, so compiled serving warms one shape.
+        past_str = " ; ".join(_discretize_state(s, fixed_width=True) for s in past_states)
+        return (f"Task: {cleaned}, Past states: {past_str}, "
+                f"State: {_discretize_state(normalized_state, fixed_width=True)}")
+    return f"Task: {cleaned}, State: {_discretize_state(normalized_state)}"
 
 
 def make_action_chunk(
@@ -168,19 +223,32 @@ def apply_delta_actions(chunk: np.ndarray, state: np.ndarray, delta_mask: np.nda
 
 
 def compute_norm_stats(
-    episodes: Sequence[Dict], horizon: int, delta_mask: Optional[np.ndarray]
+    episodes: Sequence[Dict], horizon: int, delta_mask: Optional[np.ndarray],
+    max_chunk_rows: int = 50_000_000,
 ) -> Dict[str, Dict[str, list]]:
     """q01/q99/mean/std for states and (delta-transformed) action chunks, openpi-style.
 
     Stats are computed over the transformed action values the model will actually see,
-    i.e. after the delta conversion and over all chunk offsets.
+    i.e. after the delta conversion and over all chunk offsets. For large datasets the
+    full chunk tensor (frames x horizon x dims) does not fit in RAM (e.g. the 3000-episode
+    ABC conversion is ~9M frames -> 24+ GB), so timesteps are subsampled with a
+    deterministic stride chosen to keep at most `max_chunk_rows` chunk rows; datasets
+    below the cap (every existing trossen set) are computed exactly as before (stride 1).
     """
+    total_frames = sum(len(ep["actions"]) for ep in episodes)
+    stride = max(1, int(np.ceil(total_frames * horizon / max_chunk_rows)))
+    if stride > 1:
+        print(f"[compute_norm_stats] {total_frames} frames x horizon {horizon}: "
+              f"subsampling every {stride}th timestep to bound memory")
     all_states = []
     all_action_values = []
-    for ep in episodes:
+    for ep_i, ep in enumerate(episodes):
         states, actions = ep["states"], ep["actions"]
-        all_states.append(states)
-        for t in range(len(actions)):
+        # DAgger episodes (min_start > 0): stats cover only the timesteps that can be
+        # sampled for training -- the human-correction segment -- matching _build_item.
+        start = int(ep.get("min_start", 0))
+        all_states.append(states[start:])
+        for t in range(start + (ep_i % stride), len(actions), stride):
             all_action_values.append(make_action_chunk(actions, states[t], t, horizon, delta_mask))
     states = np.concatenate(all_states, axis=0)
     action_values = np.concatenate(all_action_values, axis=0).reshape(-1, states.shape[-1])
@@ -210,18 +278,33 @@ class RobotFlowMatchingDataset(Dataset):
         self.delta_mask = make_delta_mask(data_args.delta_mask) if data_args.use_delta_actions else None
         self.wrist_cameras = [c.strip() for c in data_args.wrist_cameras.split(",") if c.strip()]
 
+        if data_args.action_space not in ("joint", "ee6d"):
+            raise ValueError(f"unknown action_space {data_args.action_space!r}")
+        if data_args.state_history and not data_args.image_history:
+            raise ValueError("--state_history is frame-aligned to the image history; "
+                             "it requires --image_history True")
         num_dims = len(self.active_dims) if self.active_dims is not None else None
+        if data_args.action_space == "ee6d":
+            # The FK conversion consumes the SELECTED 7 joint dims and emits EE_DIM;
+            # everything downstream (action_dim, delta_mask) lives in EE space.
+            if num_dims != 7:
+                raise ValueError(
+                    f"action_space=ee6d requires active_dims selecting the 7-dim right arm "
+                    f"(got {num_dims}); FK is defined for [q0..q5, jaw]."
+                )
+            num_dims = EE_DIM
         if num_dims is not None and num_dims != data_args.action_dim:
             raise ValueError(
-                f"active_dims '{data_args.active_dims}' selects {num_dims} dims but "
-                f"action_dim is {data_args.action_dim}; they must match (and the model's "
-                "expert action_dim comes from action_dim)."
+                f"active_dims '{data_args.active_dims}' (action_space="
+                f"{data_args.action_space}) implies {num_dims} dims but action_dim is "
+                f"{data_args.action_dim}; they must match (and the model's expert "
+                "action_dim comes from action_dim)."
             )
         if self.delta_mask is not None and num_dims is not None and len(self.delta_mask) != num_dims:
             raise ValueError(
                 f"delta_mask '{data_args.delta_mask}' covers {len(self.delta_mask)} dims but "
-                f"active_dims selects {num_dims}; the mask applies to the SELECTED dims "
-                "(e.g. '6,-1' for one 7-dof arm)."
+                f"the {data_args.action_space} representation has {num_dims}; the mask "
+                "applies to the REPRESENTATION dims (e.g. '6,-1' for joints, '9,-1' for ee6d)."
             )
 
         self.episodes = self._scan_episodes(data_args)
@@ -316,6 +399,7 @@ class RobotFlowMatchingDataset(Dataset):
 
             chunk_dirs = sorted((root / "data").glob("chunk-*"))
             subtask_labels = {}
+            instructions = {}
             per_root = []
             for chunk_dir in chunk_dirs:
                 chunk_name = chunk_dir.name
@@ -323,6 +407,14 @@ class RobotFlowMatchingDataset(Dataset):
                 if labels_path.exists():
                     with open(labels_path) as f:
                         subtask_labels.update(json.load(f))
+                # Optional per-episode task instructions (multi-task datasets, e.g. the
+                # ABC-130k conversion). Keyed by video basename like subtask_labels.json.
+                # Absent -> episode["instruction"] is None -> prompt falls back to the
+                # global --subtask_question, so single-task datasets are unaffected.
+                instructions_path = root / "videos" / chunk_name / "instructions.json"
+                if instructions_path.exists():
+                    with open(instructions_path) as f:
+                        instructions.update(json.load(f))
 
                 for parquet_path in sorted(chunk_dir.glob("episode_*.parquet")):
                     video_name = parquet_path.stem + ".mp4"
@@ -345,14 +437,35 @@ class RobotFlowMatchingDataset(Dataset):
                     if missing_wrist:
                         continue
 
-                    df = pd.read_parquet(parquet_path, columns=["observation.state", "action"])
+                    # DAgger recordings carry a per-frame human-intervention flag. Frames
+                    # before the first intervention are the policy's own (erroneous)
+                    # rollout: usable as history context, but never as a training
+                    # timestep (see min_start in _build_item / compute_norm_stats).
+                    has_iv = "is_intervention" in pq.read_schema(parquet_path).names
+                    df = pd.read_parquet(
+                        parquet_path,
+                        columns=["observation.state", "action"] + (["is_intervention"] if has_iv else []),
+                    )
                     states = np.stack(df["observation.state"].to_numpy()).astype(np.float32)
                     actions = np.stack(df["action"].to_numpy()).astype(np.float32)
+                    min_start = 0
+                    if has_iv:
+                        flags = np.stack(df["is_intervention"].to_numpy()).astype(np.float32).ravel() > 0.5
+                        min_start = int(flags.argmax()) if flags.any() else 0
                     if self.active_dims is not None:
                         # Slice once at load time: everything downstream (delta transform,
                         # norm stats, prompt state, chunks) lives in the selected space.
                         states = states[:, self.active_dims]
                         actions = actions[:, self.active_dims]
+                    if data_args.min_episode_len and len(states) < data_args.min_episode_len:
+                        print(f"[RobotFlowMatchingDataset] skipping {parquet_path.stem}: "
+                              f"{len(states)} < min_episode_len {data_args.min_episode_len}")
+                        continue
+                    if data_args.action_space == "ee6d":
+                        # Joints -> [xyz, 6D rotation, jaw] once at load; every consumer
+                        # (deltas, norm stats, prompt state, FAST) then lives in EE space.
+                        states = joints_to_ee(states)
+                        actions = joints_to_ee(actions)
                     per_root.append(
                         {
                             "states": states,
@@ -360,6 +473,8 @@ class RobotFlowMatchingDataset(Dataset):
                             "video_path": str(video_path),
                             "wrist_paths": wrist_paths,
                             "subtasks": subtask_labels.get(video_name, []),
+                            "instruction": instructions.get(video_name),
+                            "min_start": min_start,
                         }
                     )
 
@@ -368,9 +483,83 @@ class RobotFlowMatchingDataset(Dataset):
             episodes.extend(per_root[:split_idx])
         return episodes
 
+    def _check_norm_stats_meta(self, meta: Dict, data_args: RobotDataArguments, path: str):
+        """A frozen stats artifact must describe the SAME action space this run uses;
+        a different source dataset / split only warns (expected when serving)."""
+        structural = {
+            "horizon": self.horizon,
+            "use_delta_actions": data_args.use_delta_actions,
+            "delta_mask": data_args.delta_mask,
+            "active_dims": data_args.active_dims,
+        }
+        # Action space: legacy artifacts predate the field and are all joint-space.
+        theirs_space = meta.get("action_space", "joint")
+        if theirs_space != data_args.action_space:
+            raise ValueError(
+                f"norm stats at {path} are for action_space={theirs_space!r} but this run "
+                f"uses {data_args.action_space!r} -- wrong representation, refusing."
+            )
+        missing = [k for k in structural if k not in meta]
+        if missing:
+            # Trusting a file whose action space can't be verified would defeat the point
+            # of the check -- normalization mismatches degrade the policy silently.
+            raise ValueError(
+                f"norm stats at {path} lack meta key(s) {missing} so their action space "
+                "cannot be verified -- refusing to trust them. Refit with "
+                "scripts/train_fast_tokenizer.py (which stamps a full meta block)."
+            )
+        for key, ours in structural.items():
+            theirs = meta[key]
+            same = theirs == ours
+            if not same:
+                # Spec strings may differ while meaning the same thing ('' vs None
+                # active_dims, '6,-1' with stray spaces) -- compare the parsed forms.
+                try:
+                    if key == "active_dims":
+                        a, b = parse_active_dims(theirs), parse_active_dims(ours)
+                        same = (a is None) == (b is None) and (a is None or np.array_equal(a, b))
+                    elif key == "delta_mask":
+                        same = np.array_equal(make_delta_mask(theirs), make_delta_mask(ours))
+                except (ValueError, TypeError, AttributeError):
+                    same = False
+            if not same:
+                raise ValueError(
+                    f"norm stats at {path} were computed with {key}={theirs!r} but this "
+                    f"run uses {ours!r} -- wrong action space, refusing to continue."
+                )
+        for key in ("robot_data_dirs", "train_split"):
+            if key in meta and meta[key] != getattr(data_args, key):
+                print(
+                    f"[RobotFlowMatchingDataset] note: norm stats {path} were computed over "
+                    f"{key}={meta[key]!r} (this run: {getattr(data_args, key)!r}) -- fine when "
+                    "serving a frozen artifact; refit the FAST tokenizer + stats if this is a "
+                    "NEW training dataset."
+                )
+
     def _load_or_compute_norm_stats(self, data_args: RobotDataArguments) -> Dict:
-        if data_args.norm_stats_path:
-            stats_path = Path(data_args.norm_stats_path)
+        # Frozen-artifact stats, trusted as-is (never recomputed, never written back):
+        #   1. an existing file at --norm_stats_path (serving passes the checkpoint's copy);
+        #   2. else norm_stats.json saved next to the FAST tokenizer by
+        #      scripts/train_fast_tokenizer.py -- stats and tokenizer are one artifact
+        #      (FAST is fit inside the normalized space the stats define).
+        # This keeps stats attached to model artifacts, not dataset dirs, so a new
+        # training mix can never silently overwrite the file an older served model reads.
+        explicit = Path(data_args.norm_stats_path) if data_args.norm_stats_path else None
+        candidates = [(explicit, "--norm_stats_path")]
+        if explicit is None and data_args.fast_tokenizer_path:
+            candidates.append((Path(data_args.fast_tokenizer_path) / "norm_stats.json", "FAST tokenizer dir"))
+        for candidate, origin in candidates:
+            if candidate is not None and candidate.exists():
+                with open(candidate) as f:
+                    stats = json.load(f)
+                self._check_norm_stats_meta(stats.get("meta", {}), data_args, str(candidate))
+                print(f"[RobotFlowMatchingDataset] norm stats ({origin}): {candidate}")
+                return stats
+
+        # Legacy cache in the first dataset dir (or an explicit path that doesn't exist
+        # yet): reuse when the meta matches exactly, else compute and (over)write.
+        if explicit is not None:
+            stats_path = explicit
         else:
             first_root = Path(data_args.robot_data_dirs.split(",")[0].strip())
             stats_path = first_root / "qwen_action_expert_norm_stats.json"
@@ -383,14 +572,56 @@ class RobotFlowMatchingDataset(Dataset):
             "robot_data_dirs": data_args.robot_data_dirs,
             "train_split": data_args.train_split,
         }
+        # Fingerprint DAgger min_start gating so pre-gating caches are not reused for a
+        # gated mix; only added when nonzero so existing plain-dataset caches stay valid.
+        total_min_start = sum(int(ep.get("min_start", 0)) for ep in self.episodes)
+        if total_min_start:
+            meta["min_start_frames"] = total_min_start
+        # Same back-compat convention for the newer fields: only stamped when non-default.
+        if data_args.action_space != "joint":
+            meta["action_space"] = data_args.action_space
+        if data_args.min_episode_len:
+            meta["min_episode_len"] = data_args.min_episode_len
         if stats_path.exists():
             with open(stats_path) as f:
                 cached = json.load(f)
             if cached.get("meta") == meta:
                 print(f"[RobotFlowMatchingDataset] loaded norm stats from {stats_path}")
                 return cached
+            # NEVER overwrite an existing stats file on a meta mismatch: a deployed model
+            # may resolve its stats to this exact file (the pre-relocation convention), and
+            # os.replace-ing it with a new mix's stats would silently change what that
+            # model serves. Loud error > silent clobber.
+            raise ValueError(
+                f"norm stats at {stats_path} were computed for a different config\n"
+                f"  cached meta: {cached.get('meta')}\n"
+                f"  this run:    {meta}\n"
+                "Refusing to overwrite a file an already-deployed model may read. For a new "
+                "data mix, refit the FAST tokenizer (scripts/train_fast_tokenizer.py now "
+                "saves norm_stats.json next to it, which this loader prefers) or pass "
+                "--norm_stats_path pointing at a NEW file. Delete the cached file only if "
+                "you are certain nothing serves from it."
+            )
+
+        # Multi-rank runs: only global rank 0 computes (the compute walks every episode
+        # and is memory-heavy at large scale); other ranks poll for rank 0's atomic write.
+        rank = int(os.environ.get("RANK", "0"))
+        if rank != 0:
+            print(f"[RobotFlowMatchingDataset] rank {rank} waiting for norm stats {stats_path}")
+            deadline = time.time() + 3600
+            while time.time() < deadline:
+                time.sleep(5)
+                if stats_path.exists():
+                    with open(stats_path) as f:
+                        cached = json.load(f)
+                    if cached.get("meta") == meta:
+                        return cached
+            raise RuntimeError(f"rank {rank}: timed out waiting for norm stats {stats_path}")
 
         print(f"[RobotFlowMatchingDataset] computing norm stats -> {stats_path}")
+        # Fail on an unwritable target BEFORE the minutes-long compute (a crash at the
+        # write would also leave non-zero ranks polling until their 1h timeout).
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
         stats = compute_norm_stats(self.episodes, self.horizon, self.delta_mask)
         stats["meta"] = meta
         # Atomic write so concurrent ranks don't read a partial file.
@@ -460,6 +691,12 @@ class RobotFlowMatchingDataset(Dataset):
             frame = video[0]
         img = Image.fromarray(frame.numpy())
         w, h = img.size
+        # GATE 1 of 2 for stills (the wrist, and the top frame in no-history mode). This is
+        # OUR resize, before the processor ever sees the image; GATE 2 is the processor's own
+        # --max_pixels ceiling. Because this one runs first and shrinks the image, raising
+        # only --max_pixels changes nothing -- the image is already under the ceiling. To give
+        # the wrist more resolution, raise --wrist_max_pixels AND --max_pixels together.
+        # (History frames never pass through here: they go to the video processor raw.)
         if w * h > budget:
             scale = (budget / (w * h)) ** 0.5
             img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.BILINEAR)
@@ -470,6 +707,38 @@ class RobotFlowMatchingDataset(Dataset):
         budget = self.data_args.wrist_max_pixels
         return [self._extract_single_frame(p, t, budget) for p in episode.get("wrist_paths", [])]
 
+    def _augment(self, frames: List[Image.Image], geometric: bool) -> List[Image.Image]:
+        """pi05-style augmentation with ONE parameter draw applied to every frame in
+        `frames` (see RobotDataArguments.image_aug for the per-clip rationale).
+        geometric=True (top-down camera): RandomCrop 95% + resize back + rotate U(-5,5)
+        + jitter. geometric=False (wrists, like openpi): jitter only."""
+        import torchvision.transforms.functional as TF
+        from torchvision.transforms import InterpolationMode
+
+        out = frames
+        if geometric:
+            w, h = out[0].size
+            cw, ch = int(round(w * 0.95)), int(round(h * 0.95))
+            x0 = random.randint(0, w - cw)
+            y0 = random.randint(0, h - ch)
+            angle = random.uniform(-5.0, 5.0)
+            out = [TF.resize(TF.crop(f, y0, x0, ch, cw), [h, w],
+                             interpolation=InterpolationMode.BILINEAR) for f in out]
+            out = [TF.rotate(f, angle, interpolation=InterpolationMode.BILINEAR) for f in out]
+        # openpi/augmax ColorJitter, matched to pi05's EFFECTIVE behavior: fires with
+        # p=0.5 per camera draw (augmax default -- pi05 does not jitter every image);
+        # brightness/contrast factor ranges [1-x, 1+x] plus the augmax default hue shift
+        # U(-0.1, 0.1); saturation omitted (augmax's saturation jitter is a no-op, the
+        # result is discarded, so pi05 never trained with it). One draw shared by all
+        # frames of this camera.
+        if random.random() < 0.5:
+            b = random.uniform(0.7, 1.3)
+            c = random.uniform(0.6, 1.4)
+            h = random.uniform(-0.1, 0.1)
+            out = [TF.adjust_hue(TF.adjust_contrast(TF.adjust_brightness(f, b), c), h)
+                   for f in out]
+        return out
+
     def _subtask_at(self, episode: Dict, t: int) -> str:
         for segment in episode["subtasks"]:
             if segment["start"] <= t <= segment["end"]:
@@ -479,34 +748,60 @@ class RobotFlowMatchingDataset(Dataset):
     def _build_item(self, idx: int) -> Dict[str, torch.Tensor]:
         episode = self.episodes[idx]
         num_steps = len(episode["states"])
-        t = random.randint(0, num_steps - 1)
+        # min_start > 0 on DAgger episodes: only the human-correction segment may be a
+        # training timestep. _extract_frames still gets the raw t, so the image history
+        # reaches back past min_start into the policy's own mistake -- by design.
+        t = random.randint(int(episode.get("min_start", 0)), num_steps - 1)
 
         state = episode["states"][t]
         actions = make_action_chunk(episode["actions"], state, t, self.horizon, self.delta_mask)
         norm_state = quantile_normalize(state, self.norm_stats["state"])
         norm_actions = quantile_normalize(actions, self.norm_stats["actions"])
+        # States at the image-history timesteps (oldest first, newest frame's state == the
+        # current state above): SAME indices and edge-clamping as _extract_frames.
+        norm_past = None
+        if self.data_args.state_history:
+            idxs = [max(0, t - k * self.stride) for k in range(self.num_frames - 1, 0, -1)]
+            norm_past = quantile_normalize(episode["states"][idxs], self.norm_stats["state"])
+
+        # One decision per SAMPLE; each camera then gets its own parameter draw.
+        aug_on = (self.data_args.image_aug and not getattr(self, "_aug_disabled", False)
+                  and random.random() < self.data_args.image_aug_prob)
 
         wrist_images = self._extract_wrist_images(episode, t)
+        if aug_on:
+            wrist_images = [self._augment([im], geometric=False)[0] for im in wrist_images]
         subtask = self._subtask_at(episode, t)
 
         if self.data_args.predict_subtask:
-            # The prompt is a fixed question; the subtask is the assistant answer to predict.
-            task_text = self.data_args.subtask_question
-            assistant_text = subtask
+            # The prompt is the episode's task instruction when the dataset carries one
+            # (videos/chunk-*/instructions.json, e.g. the ABC-130k conversion), else the
+            # fixed --subtask_question; the subtask is the assistant answer to predict.
+            task_text = episode.get("instruction") or self.data_args.subtask_question
+            # Mixed supervision: an episode with NO subtask labels contributes no language
+            # signal (no assistant turn; the VLM is supervised through FAST alone).
+            # Supervising the "waiting" fallback instead would teach the VLM a false
+            # description of the scene on every unlabeled sample. Labeled episodes are
+            # untouched, so datasets with and without labels mix freely in one run.
+            assistant_text = subtask if episode["subtasks"] else None
         else:
             # Subtask-input mode: the subtask IS the prompt; no subtask prediction (the VLM is
             # supervised only through FAST). At inference the subtask is provided by the caller.
             task_text = subtask
             assistant_text = None
-        prompt = format_robot_prompt(task_text, norm_state)
+        prompt = format_robot_prompt(task_text, norm_state, past_states=norm_past)
 
         # Top-down cam_high (history video, or a single current still if image_history=False),
         # then the current-timestep wrist still(s), then the text.
         if self.data_args.image_history:
             top_frames = self._extract_frames(episode, t)
+            if aug_on:
+                top_frames = self._augment(top_frames, geometric=True)
             content = [{"type": "video", "video": top_frames}]
         else:
             top_img = self._extract_single_frame(episode["video_path"], t, self.data_args.max_pixels)
+            if aug_on:
+                top_img = self._augment([top_img], geometric=True)[0]
             top_frames = [top_img]
             content = [{"type": "image", "image": top_img}]
         content += [{"type": "image", "image": img} for img in wrist_images]
@@ -543,7 +838,12 @@ class RobotFlowMatchingDataset(Dataset):
             ids = input_ids[0].tolist()
             pos = 0
             while pos < len(ids):
-                if ids[pos] == 77091:
+                # Require the full <|im_start|>assistant bigram (151644, 77091): a bare
+                # 77091 also appears when user text contains punctuation-adjacent
+                # "assistant" (e.g. '(assistant)'), and matching it alone would unmask
+                # user-prompt tokens as labels AND insulate the expert from part of the
+                # user turn (incl. the state string) -- silently, per episode.
+                if ids[pos] == 77091 and pos > 0 and ids[pos - 1] == 151644:
                     ans_start = pos + 2
                     ans_end = ans_start
                     while ans_end < len(ids) and ids[ans_end] != 151645:
@@ -555,6 +855,18 @@ class RobotFlowMatchingDataset(Dataset):
                         subtask_token_mask[0, pos - 1 : ans_end + 2] = True
                         pos = ans_end
                 pos += 1
+        else:
+            # No assistant turn (subtask-input mode, or an unlabeled episode under mixed
+            # supervision): the sequence still ends with the 3-token generation header
+            # <|im_start|>assistant\n. Insulated serving masks that header from the expert
+            # (inference.subtask_token_mask_for), so mark it here too -- otherwise these
+            # training samples would let the expert attend tokens serving hides from it.
+            # The FAST tokens appended below stay unmasked via the padding of this mask.
+            ids = input_ids[0].tolist()
+            for i in range(len(ids) - 1):
+                if ids[i] == 151644 and ids[i + 1] == 77091:
+                    subtask_token_mask[0, i:] = True
+                    break
         # Append FAST action tokens (supervised with cross-entropy) BEFORE computing
         # position_ids so positions cover the whole sequence. fast_token_mask marks the
         # appended region, which the model excludes from the continuous expert's attention.

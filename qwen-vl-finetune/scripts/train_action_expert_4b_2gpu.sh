@@ -32,7 +32,7 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
 
 MODEL_PATH="Qwen/Qwen3-VL-4B-Instruct"
 # NEW empty output dir -> nothing to auto-resume -> trains FROM SCRATCH. Keep it empty.
-OUTPUT_DIR="/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/qwen3_4b_ae_hist_subpred_0717merged_test"
+OUTPUT_DIR="/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/qwen3_4b_ae_hist_subpred_0717merged"
 CACHE_DIR="$CUSTOM_CACHE_DIR/huggingface"
 ROBOT_DATA_DIRS="/iris/projects/humanoid/trossen_data/0717_green_yellow_block_mem_merged"
 RUN_NAME="qwen3vl_4b_ae_hist_subpred_0717merged_bs32"
@@ -72,6 +72,39 @@ if [ "$EXPERT_VLM_LAYERS" -gt 0 ]; then
     RUN_NAME="${RUN_NAME}_L${EXPERT_VLM_LAYERS}"
 fi
 
+# Visual token budget. These are PIXEL AREAS, not token counts (see argument.py:19-30).
+# Conversion on Qwen3-VL: video 1 token = 32*32*2 = 2048 px, stills 1 token = 32*32 = 1024 px.
+#   tokens per history frame ~= VIDEO_MAX_PIXELS / (num_frames * 2048), minus ~15% to rounding.
+# The old default (1024*28*28 = 802,816) was Qwen2 arithmetic (28 = 14px patch * 2) and gave
+# only 33 tok/frame -- HALF of the 64-token floor Qwen3-VL itself ships in its
+# preprocessor_config.json. 1,600,000 puts history frames at 512x288 = 72 tok/frame.
+# The wrist needs BOTH knobs raised: WRIST_MAX_PIXELS is our own pre-resize in
+# robot_data.py:463, MAX_PIXELS is the processor's ceiling; the smaller one wins, so raising
+# one alone does nothing. 131,072 -> 480x256 = 120 tokens (was 45).
+# Verify any change with: python scripts/trace_image_pipeline.py
+VIDEO_MAX_PIXELS=1600000   # <-- edit me: 802816 = old 33 tok/frame; 2097152 = 95 tok/frame
+WRIST_MAX_PIXELS=131072
+MAX_PIXELS=131072
+OUTPUT_DIR="${OUTPUT_DIR}_vis$((VIDEO_MAX_PIXELS / 100000))"
+RUN_NAME="${RUN_NAME}_vis$((VIDEO_MAX_PIXELS / 100000))"
+
+# ---- Optimizer recipe v2 (2026-07-28 audit vs openpi/SmolVLA; see ACTION_EXPERT.md) ----
+# * weight decay: --weight_decay 0 is now actually honored (a trainer bug let torch's
+#   default 0.01 apply silently to both param groups; fixed in ActionExpertTrainer)
+# * adam_beta2 0.95 (was HF default 0.999): matched memory lengths for Adam's two running
+#   averages -- what openpi, SmolVLA, and LLM training use; prevents oversized steps for
+#   ~hundreds of steps after gradient-regime shifts
+# * EMA 0.99 on the expert+heads (ExpertEMACallback): the checkpoint carries ema_expert.pt
+#   and inference AUTOMATICALLY serves the averaged weights, like openpi/Diffusion Policy.
+#   The raw iterate is what flickers; the EMA copy is the deployable policy.
+# * 10k steps (was 26k): 10k x batch 32 = 320k samples ~= 7 passes over the 43k-timestep
+#   dataset; cosine anneals to 0 AT 10k, so let it FINISH -- a mid-schedule checkpoint is
+#   a noisy iterate (measured: 5-10% of motion range was noise-seed variance at 15.5k/26k).
+#   EMA makes mid-run checkpoints servable anyway if you must stop early.
+EMA_DECAY=0.99
+OUTPUT_DIR="${OUTPUT_DIR}_opt2"
+RUN_NAME="${RUN_NAME}_opt2"
+
 # Input-dump sanity check: at startup, rank 0 writes the first few FULLY-PROCESSED model
 # inputs to <OUTPUT_DIR>/input_dumps/ -- PNGs reconstructed from pixel_values (exactly what
 # the vision tower sees; *_compare.png = [native | model-view upscaled]) plus report.txt
@@ -96,7 +129,7 @@ args=(
     --action_horizon 50
     --use_delta_actions True
     --wrist_cameras "cam_right_wrist"
-    --wrist_max_pixels 50176
+    --wrist_max_pixels "$WRIST_MAX_PIXELS"
     --default_prompt "waiting"
     --train_split 1.0
     # ---- knowledge insulation + FAST (identical to the source run) ----
@@ -107,7 +140,9 @@ args=(
     # kept untouched for inference with pre-0714 checkpoints.
     --fast_tokenizer_path /iris/projects/humanoid/ke/Qwen3-VL/checkpoints/fast_tokenizer_trossen_0717merged
     --fast_loss_weight 1.0
-    --max_pixels 50176
+    # ---- visual token budget (see the block above) ----
+    --video_max_pixels "$VIDEO_MAX_PIXELS"
+    --max_pixels "$MAX_PIXELS"
     --min_pixels 784
     # ---- training-time RTC (0 = off; see RTC_MAX_DELAY above) ----
     --rtc_prefix_max_length "$RTC_MAX_DELAY"
@@ -117,8 +152,11 @@ args=(
     --expert_num_layers "$EXPERT_VLM_LAYERS"
     # ---- training ----
     --bf16
+    # optimizer recipe v2 (see block above)
+    --adam_beta2 0.95
+    --ema_decay "$EMA_DECAY"
     # 2 GPUs x per_device 4 x grad_accum 4 = effective batch 32. (grad_accum 2 -> 16.)
-    --max_steps 26000
+    --max_steps 10000
     --per_device_train_batch_size 4
     --gradient_accumulation_steps 4
     --eval_strategy "no"

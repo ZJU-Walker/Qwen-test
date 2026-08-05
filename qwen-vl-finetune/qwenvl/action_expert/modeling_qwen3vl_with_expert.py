@@ -316,6 +316,52 @@ class Qwen3VLWithActionExpert(nn.Module):
         return lm_loss, fast_loss
 
     # ------------------------------------------------------------------
+    # torch.compile of the expert Euler step (Phase 4 latency work)
+    # ------------------------------------------------------------------
+    def enable_expert_compile(self, bucket: int = 64, mode: str = "reduce-overhead"):
+        """Compile `_expert_forward` -- the function called once per Euler step, whose
+        ~1000 tiny kernel launches per call dominate the flow loop (profiled ~27 ms/step
+        with the GPU largely idle awaiting CPU dispatch). `reduce-overhead` records the
+        kernels into a CUDA graph and replays them with a single dispatch.
+
+        Compiled graphs are shape-specialized (`dynamic=False`), and the prompt length
+        jitters a few tokens between requests (the discretized state string changes
+        width) -- so `sample_actions` pads the prefix KV/masks up to a multiple of
+        `bucket` tokens (see _pad_prefix_to_bucket). Every request then presents
+        identical shapes and there are NO mid-episode recompile stalls. Callers should
+        warm up (2+ calls) before serving and verify against eager output."""
+        self._compile_bucket = bucket
+        # mode=None -> bucket padding WITHOUT compilation (an eager-but-padded reference:
+        # lets callers separate padding numerics -- bf16 SDPA tiling changes with length --
+        # from compile numerics, and gate strictly on the latter).
+        self._compiled_expert = self._expert_forward if mode is None else torch.compile(
+            self._expert_forward, mode=mode, fullgraph=False, dynamic=False
+        )
+
+    def disable_expert_compile(self):
+        self._compiled_expert = None
+
+    def _pad_prefix_to_bucket(self, prefix_key_values, attention_mask, position_ids,
+                              subtask_token_mask):
+        """Right-pad the prefix (KV + masks + positions) to a multiple of the compile
+        bucket. Padded slots carry attention_mask=0, so `_expert_forward`'s obs_mask
+        excludes them from the softmax -- numerically this only perturbs bf16 SDPA tiling
+        (~5e-3, same class as the validated single-prefill/insulation deltas)."""
+        S = prefix_key_values[0][0].shape[2]
+        bucket = self._compile_bucket
+        pad = (bucket - S % bucket) % bucket
+        if pad == 0:
+            return prefix_key_values, attention_mask, position_ids, subtask_token_mask
+        prefix_key_values = [
+            (F.pad(k, (0, 0, 0, pad)), F.pad(v, (0, 0, 0, pad))) for k, v in prefix_key_values
+        ]
+        attention_mask = F.pad(attention_mask, (0, pad), value=0)
+        position_ids = F.pad(position_ids, (0, pad), value=0)
+        if subtask_token_mask is not None:
+            subtask_token_mask = F.pad(subtask_token_mask, (0, pad), value=False)
+        return prefix_key_values, attention_mask, position_ids, subtask_token_mask
+
+    # ------------------------------------------------------------------
     # Suffix (expert) helpers
     # ------------------------------------------------------------------
     def _suffix_position_embeddings(self, obs_positions, suffix_len, batch_size, device, dtype):
@@ -591,6 +637,16 @@ class Qwen3VLWithActionExpert(nn.Module):
             noise = _clamp_action_prefix(noise, action_prefix, rtc_mask)
 
         # No FAST tokens at inference; the expert attends to all valid prefix tokens.
+        # Compiled path: pad the prefix to the compile bucket so every request presents
+        # the same shapes (no recompiles), then run the compiled per-step forward.
+        expert_fn = getattr(self, "_compiled_expert", None)
+        if expert_fn is not None:
+            prefix_key_values, attention_mask, position_ids, subtask_token_mask = \
+                self._pad_prefix_to_bucket(prefix_key_values, attention_mask,
+                                           position_ids, subtask_token_mask)
+        else:
+            expert_fn = self._expert_forward
+
         dt = -1.0 / num_steps
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
@@ -600,7 +656,7 @@ class Qwen3VLWithActionExpert(nn.Module):
             else:
                 # pin prefix tokens to CLEAN, postfix tokens to the current denoising time
                 timestep = torch.where(rtc_mask, _CLEAN_TIMESTEP, time)  # (B, ah)
-            v_t = self._expert_forward(
+            v_t = expert_fn(
                 x_t, timestep, prefix_key_values, attention_mask, position_ids,
                 None, subtask_token_mask
             )

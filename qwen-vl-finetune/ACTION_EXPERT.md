@@ -211,6 +211,49 @@ compression ladder). Workflow: start training, wait for the `[input-dump]` conso
 inspect, kill the run if you only wanted the check. Code: `qwenvl/data/input_inspect.py`,
 hook at the end of `RobotFlowMatchingDataset._build_item`.
 
+### Optimizer recipe v2 (2026-07-28 audit)
+
+Audit vs openpi (`pi05_trossen_memory`) + SmolVLA + Diffusion Policy after flickery
+trajectories were traced to weight-iterate noise (5-10% of the predicted motion was
+noise-seed variance at a fixed observation, on a mid-schedule raw checkpoint). Changes:
+
+- **weight-decay bug fixed**: the custom two-lr param groups omitted `weight_decay`, so
+  torch AdamW's default **0.01** silently applied to both groups (incl. biases/norms)
+  despite `--weight_decay 0`. Groups now set it explicitly; startup logs print it.
+- **`--adam_beta2 0.95`** (was HF default 0.999): matches openpi/SmolVLA/LLM practice;
+  a 1000-step second-moment memory reacts ~100x slower than the 10-step momentum, giving
+  weights sustained oversized steps after gradient-regime shifts.
+- **EMA on the expert** (`ExpertEMACallback`, `--ema_decay 0.99`, rank-0 fp32 shadow of
+  the non-`vlm.` params ≈ 3 GB): every checkpoint carries `ema_expert.pt`, and
+  `load_model` **automatically serves the EMA copy** (server `--no_ema` for A/B). This is
+  the openpi/Diffusion-Policy deployment convention — the raw iterate is what flickers.
+  Notably openpi's `pi05_trossen_memory` schedule is 100% warmup (never anneals) and works
+  anyway: EMA does the settling. EMA also makes mid-run checkpoints servable.
+- **10k steps** (was 26k): 320k samples ≈ 7 passes over the 43k-timestep dataset; the
+  cosine anneals to 0 AT the horizon, so let runs finish — checkpoint-15500/26000 was a
+  noisy mid-glide iterate. HF recomputes the cosine from `--max_steps` at launch.
+
+Seed-variance probe = the convergence meter: predict at a fixed observation with ~8 noise
+seeds; a converged flow field collapses the spread (was 0.03-0.08 rad/dim mid-schedule).
+
+### torch.compile of the expert Euler step (Phase 4, 2026-07-30)
+
+Serve with `--compile`: the flow loop drops **141 -> 28 ms (5.1x)** on H200 (18-layer expert,
+972-token prefix, 10 steps). `enable_expert_compile()` wraps `_expert_forward` in
+`torch.compile(mode="reduce-overhead", dynamic=False)` — CUDA-graph replay of the ~1000
+kernels/step — and `sample_actions` right-pads the prefix KV/masks to a **64-token bucket**
+so the few-token prompt-length jitter between requests (state digits change width) never
+triggers a recompile (verified: 0 new graphs across lengths; a recompile would stall the
+robot for seconds). Server startup warms up BOTH timestep variants (plain + RTC per-token),
+then gates on **compiled vs eager-padded** equality (2e-2; measured ~9e-3, RTC clamp
+bit-exact) and refuses to serve on divergence. `mode="default"` (no cudagraphs) is the
+validated fallback at 36 ms (3.9x). Padding-only numerics are the known bf16 SDPA tiling
+class (~3e-3, reported at startup). Tests: `tests/smoke_test_compile_gpu.py` (equality,
+determinism, contamination probes, no-recompile, speedup; runs on the real serve ckpt).
+TEST-DESIGN GOTCHA that cost a debugging round: compare in DELTA space or with realistic
+states — a fake state of 1e6 rad makes float32's grid 0.0625 at that magnitude, and the
+"divergence" you measure is pure ULP quantization.
+
 ### Implicit HL (train with subtasks, no subtask decode at inference)
 
 This is exactly the subtask-insulation path (`--expert_attends_subtask False` + serve
@@ -220,3 +263,132 @@ entirely. It is the **zero-gap** version of pi0.5's Figure-13 "implicit HL" — 
 expert never attends the subtask in training either, dropping it at inference is exact rather
 than an approximation. Compounds with layer skipping: `EXPERT_ATTENDS_SUBTASK=False` +
 `EXPERT_VLM_LAYERS=18` in one run.
+
+## DAgger data + norm-stats relocation (2026-07-31)
+
+The 0730 DAgger sets (`0730_{green,yellow}_block_mem_dagger`, 63 eps each) are policy
+rollouts where a human took over at a pedal press and finished the task kinesthetically.
+Only the correction may be imitated; the pre-press segment is the policy's own mistake.
+
+**min_start gating** (`robot_data.py`): episodes whose parquet has an `is_intervention`
+column get `min_start` = first flagged frame (verified == `press_frame` in
+`meta/dagger_interventions.json` for all 126 eps). `_build_item` samples
+`t ~ U[min_start, n-1]`; `compute_norm_stats` and the FAST fit
+(`scripts/train_fast_tokenizer.py`) skip pre-min_start chunks the same way. Image history
+still reaches back past min_start on purpose — the model SEES its mistake in the history
+and learns the human's correction from it (that is the point of DAgger). RTC prefixes are
+the chunk's own first d steps, so they never touch pre-press actions. Plain datasets
+(no column) behave exactly as before (`min_start=0`).
+
+**Norm stats are now a frozen model-side artifact, not dataset-dir state** (the openpi
+convention: stats live in checkpoint assets). Resolution order in
+`_load_or_compute_norm_stats`: (1) `--norm_stats_path` file, (2)
+`<fast_tokenizer_path>/norm_stats.json` — written by `train_fast_tokenizer.py`, since
+tokenizer+stats are one artifact (FAST is fit inside the stats' normalized space), (3)
+legacy `<first_root>/qwen_action_expert_norm_stats.json` compute-or-cache. Trusted
+artifacts are never recomputed/overwritten; wrong action space (horizon/delta/dims)
+hard-errors, different source dataset only warns. Training stamps the resolved stats to
+`<output_dir>/norm_stats.json` (like `visual_budget.json`); serving auto-loads it via
+`load_norm_stats_path(ckpt)`. Old checkpoints hit path (3) byte-identically — and a
+legacy-path meta mismatch now HARD-ERRORS instead of recomputing in place, so nothing can
+overwrite the 0717 stats file a deployed model reads (adversarial review caught that a
+hand-edited old script — new data mix + old tokenizer dir — used to clobber it). Trusted
+artifacts must carry a full meta block (loader refuses otherwise); stamps are written
+atomically (mkstemp+replace). When copying a `serve-XXXX` dir, include `norm_stats.json`
+alongside `visual_budget.json` + `ema_expert.pt`.
+
+**DAgger run**: `scripts/train_action_expert_4b_dagger.sh` = constlr recipe on
+`0717merged + both dagger dirs` (350 eps; uniform episode draw → ~36% DAgger samples) with
+`fast_tokenizer_trossen_0717merged_0730dagger` (fit on 61,926 gated chunks; max_fast_len 96).
+Data fixes applied on disk: the green set's copy-pasted "pick up yellow block" labels were
+corrected (originals in `meta/*.bak`), and both sets got `videos/chunk-000/subtask_labels.json`
+labeling `[press_frame, end]` (pre-press stays uncovered → default "waiting", never sampled).
+Tests: `tests/smoke_test_dagger_data.py` (CPU, real data).
+
+## Mixed subtask supervision (2026-08-02)
+
+`0731_green_yellow_merged` (224 eps, 53,783 frames, same recording stack as 0717) has no
+subtask labels. In `predict_subtask` mode, an episode with NO `subtask_labels.json` entry
+now builds **no assistant turn** (`assistant_text=None` in `_build_item`): the VLM is
+supervised through FAST alone on those samples, instead of being taught the false
+"waiting" fallback. Labeled episodes are byte-identical to before, so labeled and
+unlabeled datasets mix freely in one run — labeling 0731 later (streamlit) is picked up
+automatically, per episode, with no config change. The unlabeled sequence (user turn +
+bare `<|im_start|>assistant\n`) is exactly the form insulated serving feeds the expert,
+and the 3-token generation header is now marked in `subtask_token_mask` on those samples
+to match `subtask_token_mask_for` at serving (train/serve insulation parity, verified
+token-exact). Artifacts: `fast_tokenizer_trossen_0717merged_0731gy` (97,033 chunks,
+round-trip 0.0088, max_fast_len 85) with its frozen `norm_stats.json`. Run:
+`scripts/train_action_expert_4b_0731gy.sh` (constlr recipe, 0717+0731, DAgger dirs
+dropped). Test: `tests/smoke_test_mixed_subtask.py`.
+
+## Attention-wiring audit (2026-08-02, adversarial + perturbation-proved)
+
+Full audit of expert attention train/serve parity under mixed subtask supervision.
+Empirical proof: `tests/smoke_test_mixed_attention_gpu.py` (real 4B, real 0717+0731
+items) — scrambling any token the expert must not see (generation header, full assistant
+turn, FAST region) leaves v_t BIT-identical (0.0); scrambling one attended state digit
+changes it; flipping insulation off on the same weights makes the header scramble matter
+(the mask, not chance, is the protection); mixed labeled+unlabeled batch through the real
+collator keeps both bool masks glued to their tokens under padding; serve-path scramble
+also bit-identical. Confirmed + FIXED findings:
+1. **Server wrist resize ignored the checkpoint's wrist_max_pixels** (major, PRE-EXISTING
+   since vis16, 2026-07-17): `/infer` used resize_wrist's legacy 50176 default -> served
+   wrist 299x168 = 45 tokens vs trained 483x272 = 120 tokens (~38%). Offline viz used the
+   dataset path (correct budget), so offline-good/robot-imprecise gaps in vis16-era evals
+   are partly explained; fine-manipulation weakness on the robot matches this signature.
+   Fixed: request path + compile warmup both use DS.data_args.wrist_max_pixels (warmup
+   previously fed a RAW 540x960 wrist -> also warmed the wrong prompt length; a --compile
+   server would recompile-stall on its first real request).
+2. Labeled-branch subtask scan matched bare token 77091 without requiring the preceding
+   <|im_start|> (unlabeled branch + serving already pair-guarded). Latent: user text
+   containing punctuation-adjacent "assistant" would have unmasked user-prompt labels and
+   insulated the expert from part of the user turn (incl. the state). Fixed: bigram guard.
+3. Two hazardous mixed-data configs now hard-error at launch: train_vlm without FAST
+   (all-unlabeled batch -> zero VLM gradient) and expert_attends_subtask=True (trains on a
+   dangling header non-insulated serving never presents).
+Known + accepted (documented, unchanged): subtask CE is a micro-batch token-mean, so its
+gradient magnitude does not scale with label density (on/off per batch; fine at our 50/50
+mix); an all-unlabeled logging step can omit lm_loss from that log line.
+
+## EE-6D actions + augmentation + left wrist (2026-08-02, "important experiment" run)
+
+**Representation** (`--action_space ee6d`): the selected 7-dim right arm is converted at
+load (`qwenvl/data/ee_repr.py`, FK from `wxai_kinematics.py` -- URDF-verified, SDK tool
+frame) to `[xyz, 6D rotation (first two R columns), jaw]` = 10 dims; `--delta_mask 9,-1`
+= plain per-dim subtraction vs state on pos+6D, jaw absolute. CHOSEN BY MEASUREMENT
+(probe_rotation_*.py on real chunks): chunk rotations reach 159 deg, naive ROTVEC
+subtraction is off by 7 deg median (invalid); naive 6D-delta + Gram-Schmidt decode is the
+most noise-robust candidate at every angle (flat Zhou-style curves, arXiv:1812.07035).
+The whole existing delta machinery works unchanged. Serving auto-detects the
+representation from the ckpt's norm_stats.json meta (`load_repr_config`), converts client
+joint state 7->10 (`state_to_model`), and converts predicted EE chunks back with
+GS + sequential damped-least-squares IK seeded from measured joints
+(`model_actions_to_robot`); IK solves UNCLAMPED (the real robot exceeds URDF limits by
+~0.015 rad -- clamped IK cannot reach ~1% of recorded poses) with a widened-limit
+rejection; failures hold the previous command and are counted in the /infer response
+(`ik_failures`). RTC prefixes (joint-space from the client) convert inside
+`normalize_action_prefix`. Client i/o stays 7-dim joints both directions.
+GATES (tests/smoke_test_ee6d_core.py): full pipeline round trip (delta->quantile
+norm->undo->GS->IK) costs < 1 MICRON position / 0.0000 deg rotation, 0 IK failures;
+IK(FK(q)) prev-frame-seeded max 1.8e-4 rad on real frames.
+
+**Augmentation** (`--image_aug True`, prob `--image_aug_prob`): pi05's recipe -- crop 95%
++ resize + rotate +-5 deg + ColorJitter(0.3/0.4/0.5) on the top-down camera, jitter-only
+on wrists -- with ONE parameter draw per sample per camera applied to every history frame
+identically (per-clip; per-frame resampling would inject temporal shake). Applied before
+the processor, so input dumps show it. Gallery: scripts/viz_augmentation.py.
+
+**Left wrist**: `--wrist_cameras "cam_right_wrist,cam_left_wrist"`; the list is now
+stamped in visual_budget.json and overlaid at serve; /infer takes a `wrist_left` upload
+(required iff 2-wrist ckpt; /health reports wrist_cameras). Client patch (NOT applied):
+Qwen3-VL/client_left_wrist_patch.md.
+
+**Run**: scripts/train_action_expert_4b_ee6d.sh -- constlr recipe, rtc10, subinsul, L18,
+vis16, 0717+0731 mixed supervision, `--min_episode_len 50` (drops 5 short 0731 episodes:
+128/129/133/150/153), action_dim 10. FAST artifact
+`fast_tokenizer_trossen_0717m_0731gy_ee6d` (443 eps, 97,014 10-dim chunks, round-trip
+0.0099, max_fast_len 149) with frozen ee6d norm_stats.json.
+Tests: smoke_test_ee6d_core / _pipeline / _gpu (7-probe attention harness at dim 10) +
+joint-space regressions -- ALL PASS. GOTCHA: episodes.jsonl 'length' catches short
+episodes; ep 129 (11 frames) evaded an earlier <10-frame degenerate scan.

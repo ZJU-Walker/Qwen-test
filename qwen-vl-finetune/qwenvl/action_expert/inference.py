@@ -10,6 +10,7 @@ Used by both the offline viz (`scripts/infer_visualize_action_expert.py`) and th
 server (`qwen_action_expert_server.py`). Requires `qwen-vl-finetune` on sys.path.
 """
 
+import json
 import os
 
 import numpy as np
@@ -19,6 +20,7 @@ from scipy.fft import idct
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 from qwenvl.action_expert import ActionExpertConfig, Qwen3VLWithActionExpert
+from qwenvl.data.ee_repr import EE_DIM, ee_chunk_to_joints, joints_to_ee
 from qwenvl.data.robot_data import (
     RobotDataArguments,
     RobotFlowMatchingDataset,
@@ -32,18 +34,103 @@ from qwenvl.data.robot_data import (
 # ----- fixed to match scripts/train_action_expert_4b.sh -----
 MODEL_PATH = "Qwen/Qwen3-VL-4B-Instruct"
 DATA_DIRS = "/iris/projects/humanoid/trossen_data/0528_green_yellow_block_mem_merged_bk"
-FAST_TOK = "PATH_TO_FAST_TOKENIZER"  # must match training (FAST tokenization is not deterministic)
-DEFAULT_CKPT = "DEFAULT_PATH_TO_CKPT"
+FAST_TOK = "/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/fast_tokenizer_trossen"
+DEFAULT_CKPT = "/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/qwen3_4b_action_expert_fast/checkpoint-7000"
 EXPERT_HIDDEN, EXPERT_INTER, EXPERT_HEADS = 1024, 4096, 16
 ACTION_DIM, ACTION_HORIZON = 7, 50
 SUBTASK_QUESTION = "which colored block did the human hand point to?"
 WRIST_MAX_PIXELS = 50176
 
 
-def build_data_args(fast_tok=FAST_TOK, data_dirs=DATA_DIRS, image_history=True, predict_subtask=True):
+def load_visual_budget(ckpt):
+    """Read visual_budget.json written next to a checkpoint by the training script.
+
+    The pixel budgets decide how many visual tokens the model sees, and they are NOT
+    recoverable from the weights: serving a model trained at 72 tok/frame with the old
+    33 tok/frame budget raises no error, it just quietly feeds the policy a blurrier world.
+    Looks in the checkpoint dir and its parent (checkpoint-XXXX lives inside output_dir).
+    Returns {} for pre-2026-07-17 checkpoints, which trained on the old hardcoded defaults.
+    """
+    if not ckpt:
+        return {}
+    for d in (ckpt, os.path.dirname(os.path.normpath(ckpt))):
+        p = os.path.join(d, "visual_budget.json")
+        if os.path.exists(p):
+            with open(p) as f:
+                return json.load(f)
+    return {}
+
+
+def load_norm_stats_path(ckpt):
+    """Path of the norm_stats.json stamped next to a checkpoint by the training script.
+
+    Serving must normalize state/actions with EXACTLY the stats the checkpoint trained
+    with; loading them from the checkpoint (rather than a dataset dir) makes that
+    automatic. Looks in the checkpoint dir and its parent, like load_visual_budget.
+    Returns None for older checkpoints -- the dataset then falls back to the FAST
+    tokenizer dir's copy, then to the legacy per-dataset-dir file (see
+    robot_data._load_or_compute_norm_stats), preserving their old behavior exactly.
+    """
+    if not ckpt:
+        return None
+    for d in (ckpt, os.path.dirname(os.path.normpath(ckpt))):
+        p = os.path.join(d, "norm_stats.json")
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def load_repr_config(ckpt):
+    """Action-representation config from the checkpoint's stamped norm_stats.json meta.
+
+    ee6d checkpoints predict [xyz, 6D rotation, jaw] (10 dims, delta_mask 9,-1) while the
+    ROBOT interface stays 7-dim joints -- state_to_model / model_actions_to_robot convert
+    at the serve boundary. Legacy checkpoints (no stamp or no action_space key) resolve to
+    the historic joint-space defaults, so this is safe to call unconditionally."""
+    meta = {}
+    p = load_norm_stats_path(ckpt)
+    if p:
+        with open(p) as f:
+            meta = json.load(f).get("meta", {})
+    space = meta.get("action_space", "joint")
+    return {
+        "action_space": space,
+        "action_dim": EE_DIM if space == "ee6d" else ACTION_DIM,
+        "action_horizon": int(meta.get("horizon", ACTION_HORIZON)),
+        "delta_mask": meta.get("delta_mask", "6,-1"),
+        "active_dims": meta.get("active_dims", "7:14"),
+    }
+
+
+def state_to_model(ds, joints):
+    """Robot state (7 joints) -> the model's state representation."""
+    if ds.data_args.action_space == "ee6d":
+        return joints_to_ee(np.asarray(joints, dtype=np.float32))
+    return joints
+
+
+def model_actions_to_robot(ds, actions_abs, q_current, ik_max_iters=200):
+    """Model-space ABSOLUTE action chunk -> robot joint commands.
+
+    ee6d: Gram-Schmidt + sequential damped-least-squares IK seeded from the measured
+    joints (ee_repr.ee_chunk_to_joints); returns (joints, num_ik_failures) where failed
+    steps hold the previous verified command. joint space: passthrough, 0 failures.
+    ik_max_iters bounds each DLS solve (server passes its --ik_max_iters)."""
+    if ds.data_args.action_space == "ee6d":
+        return ee_chunk_to_joints(actions_abs, np.asarray(q_current, dtype=np.float64)[:6],
+                                  max_iters=ik_max_iters)
+    return actions_abs, 0
+
+
+def build_data_args(fast_tok=FAST_TOK, data_dirs=DATA_DIRS, image_history=True, predict_subtask=True,
+                    budget=None, norm_stats_path=None, repr_cfg=None):
     """image_history / predict_subtask MUST match how the checkpoint was trained (they change
     the input the model conditions on -- history video vs single still, and question+predict
-    vs subtask-as-input)."""
+    vs subtask-as-input).
+
+    `budget`: dict from load_visual_budget(ckpt); overrides the pixel defaults below so the
+    served resolution matches training. Omit only for old checkpoints trained at the defaults.
+    """
     da = RobotDataArguments()
     da.model_type = "qwen3vl"
     da.robot_data_dirs = data_dirs
@@ -64,23 +151,44 @@ def build_data_args(fast_tok=FAST_TOK, data_dirs=DATA_DIRS, image_history=True, 
     da.subtask_question = SUBTASK_QUESTION
     da.use_fast_tokens = True
     da.fast_tokenizer_path = fast_tok
+    # Checkpoint-stamped norm stats (load_norm_stats_path); None -> fall back to the
+    # FAST tokenizer dir's copy, then the legacy per-dataset-dir file.
+    da.norm_stats_path = norm_stats_path
     da.max_pixels = 50176
     da.min_pixels = 784
+    # Action representation the checkpoint was trained with (load_repr_config). Absent ->
+    # the joint-space defaults above, so old checkpoints behave exactly as before.
+    for k, v in (repr_cfg or {}).items():
+        setattr(da, k, v)
+    # Overlay the budget recorded at training time (see load_visual_budget). Anything absent
+    # keeps the legacy default above, so old checkpoints behave exactly as before.
+    # (Includes wrist_cameras for 2-wrist checkpoints.)
+    for k, v in (budget or {}).items():
+        setattr(da, k, v)
     return da
 
 
-def build_dataset(fast_tok=FAST_TOK, data_dirs=DATA_DIRS, cache_dir=None, image_history=True, predict_subtask=True):
+def build_dataset(fast_tok=FAST_TOK, data_dirs=DATA_DIRS, cache_dir=None, image_history=True,
+                  predict_subtask=True, budget=None, norm_stats_path=None, repr_cfg=None):
     """Instantiate the training dataset (registers FAST tokens on the processor, aligns
     processor pixels, loads norm stats). We use it only for its config-aligned objects
     (norm_stats, fast tokenizer + ids, delta_mask, processor, get_rope_index, and the
     image_history / predict_subtask MODE flags that inference must match)."""
     processor = AutoProcessor.from_pretrained(MODEL_PATH, cache_dir=cache_dir or os.environ.get("HF_HOME"))
-    return RobotFlowMatchingDataset(processor, build_data_args(fast_tok, data_dirs, image_history, predict_subtask))
+    return RobotFlowMatchingDataset(
+        processor,
+        build_data_args(fast_tok, data_dirs, image_history, predict_subtask, budget,
+                        norm_stats_path, repr_cfg))
 
 
-def load_model(ckpt, ds, device, expert_attends_subtask=True):
+def load_model(ckpt, ds, device, expert_attends_subtask=True, use_ema=True):
     """Rebuild Qwen3VLWithActionExpert exactly as training did, then load the checkpoint.
-    `expert_attends_subtask` MUST match training (False = subtask-insulated checkpoint)."""
+    `expert_attends_subtask` MUST match training (False = subtask-insulated checkpoint).
+
+    If the checkpoint dir contains `ema_expert.pt` (written by ExpertEMACallback), the
+    expert weights are OVERLAID with the EMA copy -- the averaged weights every working
+    flow/diffusion policy stack deploys (openpi serves its ema_params; Diffusion Policy
+    evals its ema_model). `use_ema=False` serves the raw iterate for A/B comparison."""
     try:
         vlm = Qwen3VLForConditionalGeneration.from_pretrained(
             MODEL_PATH, cache_dir=os.environ.get("HF_HOME"),
@@ -111,8 +219,10 @@ def load_model(ckpt, ds, device, expert_attends_subtask=True):
         hidden_size=EXPERT_HIDDEN,
         intermediate_size=EXPERT_INTER,
         num_attention_heads=EXPERT_HEADS,
-        action_dim=ACTION_DIM,
-        action_horizon=ACTION_HORIZON,
+        # From the dataset config so ee6d checkpoints (action_dim 10) rebuild correctly;
+        # joint-space datasets carry the historic 7/50.
+        action_dim=ds.data_args.action_dim,
+        action_horizon=ds.data_args.action_horizon,
     )
     model = Qwen3VLWithActionExpert(vlm, expert_config, train_vlm=True,
                                     expert_attends_subtask=expert_attends_subtask)
@@ -125,17 +235,39 @@ def load_model(ckpt, ds, device, expert_attends_subtask=True):
     if missing or unexpected:
         raise RuntimeError(f"state_dict mismatch: missing={missing[:5]} unexpected={unexpected[:5]}")
     del sd
+
+    ema_path = os.path.join(ckpt, "ema_expert.pt")
+    if use_ema and os.path.exists(ema_path):
+        ema = torch.load(ema_path, map_location="cpu", weights_only=True)
+        # Partial overlay: only the expert/head tensors present in the EMA file are replaced
+        # (load_state_dict casts fp32 shadow -> module dtype); the VLM keeps the main weights.
+        overlay_missing, overlay_unexpected = model.load_state_dict(ema["params"], strict=False)
+        if overlay_unexpected:
+            raise RuntimeError(f"EMA overlay has unknown tensors: {overlay_unexpected[:5]}")
+        print(f"[load_model] EMA weights ACTIVE: {len(ema['params'])} expert tensors "
+              f"(decay {ema['decay']}, step {ema['step']}) from ema_expert.pt")
+    elif use_ema:
+        print("[load_model] no ema_expert.pt in checkpoint -> serving raw weights "
+              "(normal for checkpoints trained before 2026-07-28)")
+    else:
+        print("[load_model] use_ema=False -> serving RAW (non-EMA) weights")
     return model.eval().to(device)
 
 
-def make_prompt(ds, state, task_text=None):
+def make_prompt(ds, state, task_text=None, past_states=None):
     """pi0.5-style prompt with the discretized (quantile-normalized) state. task_text defaults
     to the configured subtask_question (predict-subtask mode); pass the subtask string in
     subtask-input mode (predict_subtask=False), where the subtask is the prompt."""
     if task_text is None:
         task_text = ds.data_args.subtask_question
     norm_state = quantile_normalize(np.asarray(state, dtype=np.float32), ds.norm_stats["state"])
-    return format_robot_prompt(task_text, norm_state)
+    norm_past = None
+    if past_states is not None:
+        # (K, D) MODEL-space states at the history-frame timesteps, oldest first --
+        # normalized with the same stats, formatted before the current state (training parity).
+        norm_past = quantile_normalize(np.asarray(past_states, dtype=np.float32),
+                                       ds.norm_stats["state"])
+    return format_robot_prompt(task_text, norm_state, past_states=norm_past)
 
 
 def resize_wrist(img, budget=WRIST_MAX_PIXELS):
@@ -371,7 +503,12 @@ def normalize_action_prefix(ds, prefix_abs, state):
     applies to action chunks). The RTC contract is that clients send prefixes in ABSOLUTE
     space: with delta actions, model space depends on the observation pose, so a previous
     chunk's model-space actions would be referenced to the wrong (older) pose."""
-    delta = apply_delta_actions(np.asarray(prefix_abs, dtype=np.float32),
+    prefix_abs = np.asarray(prefix_abs, dtype=np.float32)
+    # RTC clients always send executed JOINT actions; for ee6d checkpoints convert each
+    # row into the model's EE representation before the delta/normalize transform.
+    if getattr(ds.data_args, "action_space", "joint") == "ee6d" and prefix_abs.shape[-1] == 7:
+        prefix_abs = joints_to_ee(prefix_abs)
+    delta = apply_delta_actions(prefix_abs,
                                 np.asarray(state, dtype=np.float32), ds.delta_mask)
     return quantile_normalize(delta, ds.norm_stats["actions"])
 
@@ -403,8 +540,8 @@ def predict_expert(model, mm, ds, state, noise=None, num_steps=10, action_prefix
     prefix_len = 0
     if action_prefix_abs is not None and len(action_prefix_abs) > 0:
         prefix_len = len(action_prefix_abs)
-        if prefix_len >= ACTION_HORIZON:
-            raise ValueError(f"action prefix ({prefix_len}) must be shorter than the horizon ({ACTION_HORIZON})")
+        if prefix_len >= ds.horizon:
+            raise ValueError(f"action prefix ({prefix_len}) must be shorter than the horizon ({ds.horizon})")
         prefix_norm = torch.from_numpy(
             np.ascontiguousarray(normalize_action_prefix(ds, action_prefix_abs, state))
         )[None].to(mm["input_ids"].device)
@@ -454,6 +591,6 @@ def predict_fast(model, mm, ds, state, max_new_tokens=96):
                 if ds.fast_base_id <= tid < ds.fast_base_id + ds.fast_vocab_size]
     if not fast_ids:
         return None, (len(new), 0, False)
-    dec, exact = fast_decode_tolerant(ds, fast_ids, ACTION_HORIZON, ACTION_DIM)
+    dec, exact = fast_decode_tolerant(ds, fast_ids, ds.horizon, ds.data_args.action_dim)
     delta = quantile_unnormalize(dec, ds.norm_stats["actions"])
     return undo_delta_actions(delta, np.asarray(state, dtype=np.float32), ds.delta_mask), (len(new), len(fast_ids), exact)

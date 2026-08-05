@@ -16,11 +16,24 @@ class DataArguments:
     data_flatten: bool = field(default=False)
     data_packing: bool = field(default=False)
     base_interval: int = field(default=2)
-    max_pixels: int = field(default=28 * 28 * 576)
-    min_pixels: int = field(default=28 * 28 * 16)
+    # ---- visual budgets. ALL of these are PIXEL AREAS, not edge lengths or token counts.
+    # They end up in the processor's size{shortest_edge, longest_edge} (misleading names --
+    # see update_processor_pixels in qwenvl/data/data_processor.py), which smart_resize reads
+    # as min_pixels/max_pixels. To convert to tokens on Qwen3-VL (patch 16, merge 2):
+    #     stills: 1 token = 32*32      = 1024 px
+    #     video : 1 token = 32*32 * 2  = 2048 px   (2 frames per token)
+    # WARNING: the `28 * 28` in these defaults is a QWEN2-era constant (Qwen2 used 14px
+    # patches -> 14*2 = 28 px/token). Under Qwen3 the real figure is 32, so these numbers no
+    # longer mean the token counts their authors intended.
+    # Run `python scripts/trace_image_pipeline.py` for a live, annotated end-to-end trace.
+    max_pixels: int = field(default=28 * 28 * 576)   # stills CEILING (wrist; top still in no-history mode)
+    min_pixels: int = field(default=28 * 28 * 16)    # stills FLOOR -- overrides Qwen's shipped 65536 (=64 tok) floor
     video_max_frames: Optional[int] = field(default=8)
     video_min_frames: Optional[int] = field(default=4)
-    video_max_pixels: int = field(default=1024 * 28 * 28)
+    # video budgets are for the WHOLE CLIP, not per frame: smart_resize compares
+    # num_frames * height * width against this. So tokens/frame ~= video_max_pixels /
+    # (num_frames * 2048) -- adding history frames shrinks every frame.
+    video_max_pixels: int = field(default=1024 * 28 * 28)  # = 802,816 px -> ~33 tok/frame at 10 frames
     video_min_pixels: int = field(default=256 * 28 * 28)
     video_fps: float = 2
 
