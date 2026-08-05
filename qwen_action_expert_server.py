@@ -701,6 +701,21 @@ async def infer(
 
 
 if __name__ == "__main__":
+    import socket
+
     import uvicorn
 
+    if ARGS.host == "0.0.0.0":
+        # bound to all interfaces: resolve the primary routable IP for the client URL
+        try:
+            _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            _s.connect(("8.8.8.8", 80))
+            _ip = _s.getsockname()[0]
+            _s.close()
+        except OSError:
+            _ip = socket.gethostbyname(socket.gethostname())
+    else:
+        _ip = ARGS.host
+    print(f"Clients connect to: http://{_ip}:{ARGS.port}/infer  "
+          f"(host {socket.gethostname()}, health: http://{_ip}:{ARGS.port}/health)")
     uvicorn.run(app, host=ARGS.host, port=ARGS.port)
