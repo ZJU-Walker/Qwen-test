@@ -126,6 +126,22 @@ class ActionExpertTrainer(Trainer):
         return self.optimizer
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if os.environ.get("QWEN_NAN_DEBUG"):
+            # Pre-forward scan of the embedding head rows: catches corruption written by
+            # the PREVIOUS micro-batch's backward (compute_loss runs forward only; the
+            # backward happens in the trainer after we return). Microsecond cost.
+            self._micro_idx = getattr(self, "_micro_idx", 0) + 1
+            m = model
+            while hasattr(m, "module"):
+                m = m.module
+            w = m.vlm.model.language_model.embed_tokens.weight
+            if not torch.isfinite(w[:16]).all():
+                bad = (~torch.isfinite(w[:16]).all(dim=1)).nonzero().flatten().tolist()
+                raise RuntimeError(
+                    f"[QWEN_NAN_DEBUG] embed rows {bad} went non-finite BETWEEN forwards: "
+                    f"written by the BACKWARD of micro-batch {self._micro_idx - 1} "
+                    f"(global_step {self.state.global_step}) -- an out-of-place write "
+                    f"during autograd, not the optimizer.")
         outputs = model(**inputs)
         # Stash the loss components (last micro-batch of the logging interval) so
         # flow / subtask-CE / FAST-CE contributions show up separately in the logs.
@@ -196,6 +212,23 @@ class EmbedNanWatchCallback(transformers.TrainerCallback):
 
     def on_train_begin(self, args, state, control, **kwargs):
         self._check(state, "AT INIT, before any update")
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        # After ALL the cycle's backwards, before clip+step: weights should still be
+        # clean here (backward writes grads, not params) and the GRAD tells us whether
+        # the optimizer is about to be fed non-finite values for the head rows.
+        self._check(state, "after backwards, BEFORE optimizer step")
+        try:
+            from deepspeed.utils import safe_get_full_grad
+            g = safe_get_full_grad(self._emb.weight)
+            if g is not None and not torch.isfinite(g[:16]).all():
+                bad = (~torch.isfinite(g[:16]).all(dim=1)).nonzero().flatten().tolist()
+                raise RuntimeError(
+                    f"[EmbedNanWatch] embed GRAD rows {bad} non-finite before optimizer "
+                    f"step (global_step {state.global_step}): the backward produced them; "
+                    f"the optimizer step would smear them into the weights.")
+        except ImportError:
+            pass
 
     def on_step_end(self, args, state, control, **kwargs):
         self._check(state, "after optimizer step")
@@ -534,4 +567,6 @@ def train(attn_implementation="flash_attention_2"):
 
 
 if __name__ == "__main__":
-    train(attn_implementation="flash_attention_2")
+    # QWEN_ATTN_IMPL=sdpa swaps the attention kernel (nan-debug: discriminates a
+    # flash-attn varlen kernel bug from everything else). Default unchanged.
+    train(attn_implementation=os.environ.get("QWEN_ATTN_IMPL", "flash_attention_2"))
