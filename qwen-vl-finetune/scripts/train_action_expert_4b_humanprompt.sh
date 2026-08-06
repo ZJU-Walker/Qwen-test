@@ -163,7 +163,9 @@ args=(
     --model_max_length 8192
     --gradient_checkpointing True
     --dataloader_num_workers "${NUM_WORKERS:-4}"
-    --dataloader_persistent_workers True
+    # persistent_workers requires num_workers > 0 (NUM_WORKERS=0 is the nan-debug mode:
+    # in-process data loading so the provenance ring buffer is visible to the trainer).
+    --dataloader_persistent_workers "$([ "${NUM_WORKERS:-4}" -gt 0 ] && echo True || echo False)"
     # 223 samples/epoch with per-device 2 leaves a batch-of-1 tail each epoch; that
     # singleton hit a mixed-attention-mask edge case (fully-masked rows -> nan CE that
     # poisoned the weights at epoch 1.0). Dropping the tail costs <=1 random sample/epoch.

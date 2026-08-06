@@ -461,6 +461,7 @@ class RobotFlowMatchingDataset(Dataset):
         prompt recordings are a few seconds. Stride-sampled with the final frame (the
         grasp outcome) forced in; uniformly re-spaced when over max_frames."""
         path = random.choice(self.human_prompt_pools[self._human_prompt_key(episode)])
+        self._last_prompt_path = path  # provenance for the QWEN_NAN_DEBUG ring buffer
         video, _, _ = read_video(path, pts_unit="sec", output_format="THWC")
         total = len(video)
         idxs = list(range(0, total, self.data_args.human_prompt_stride))
@@ -1027,6 +1028,20 @@ class RobotFlowMatchingDataset(Dataset):
         data_dict["attention_mask"] = [input_ids.shape[1]]
 
         data_dict["actions"] = torch.from_numpy(np.ascontiguousarray(norm_actions)).float()
+
+        if os.environ.get("QWEN_NAN_DEBUG"):
+            # Provenance ring buffer for the nan trap in train_action_expert.compute_loss.
+            # Only meaningful with dataloader_num_workers=0 (workers are separate
+            # processes; their buffers are invisible to the trainer).
+            from collections import deque
+            if not hasattr(self, "_recent_items"):
+                self._recent_items = deque(maxlen=64)
+            self._recent_items.append({
+                "video": episode["video_path"], "t": int(t),
+                "prompt_clip": getattr(self, "_last_prompt_path", None),
+                "seq_len": int(input_ids.shape[1]),
+                "fast_len": int(fast_token_mask.sum()),
+            })
 
         if self._dump_left > 0:
             self._dump_left -= 1

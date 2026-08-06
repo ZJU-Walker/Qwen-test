@@ -6,6 +6,7 @@ Launch with scripts/train_action_expert_4b.sh.
 
 import json
 import logging
+import math
 import os
 import pathlib
 import sys
@@ -131,6 +132,29 @@ class ActionExpertTrainer(Trainer):
         self._last_flow_loss = outputs.flow_loss.item() if outputs.flow_loss is not None else None
         self._last_lm_loss = outputs.lm_loss.item() if outputs.lm_loss is not None else None
         self._last_fast_loss = outputs.fast_loss.item() if outputs.fast_loss is not None else None
+        if os.environ.get("QWEN_NAN_DEBUG"):
+            comps = {"flow_loss": self._last_flow_loss, "lm_loss": self._last_lm_loss,
+                     "fast_loss": self._last_fast_loss}
+            if any(v is not None and not math.isfinite(v) for v in comps.values()):
+                # Discriminate "weights already corrupt" (a previous optimizer step did
+                # it) from "this forward created the nan" (a data-content trigger).
+                bad_params = [n for n, p in model.named_parameters()
+                              if not torch.isfinite(p).all()]
+                prov = list(getattr(self.train_dataset, "_recent_items", []))
+                dump_path = os.path.join(self.args.output_dir, "nan_batch.pt")
+                torch.save({"inputs": {k: (v.detach().cpu() if torch.is_tensor(v) else v)
+                                       for k, v in inputs.items()},
+                            "components": comps, "bad_params": bad_params,
+                            "provenance": prov, "global_step": self.state.global_step},
+                           dump_path)
+                raise RuntimeError(
+                    f"[QWEN_NAN_DEBUG] non-finite loss {comps} at global_step "
+                    f"{self.state.global_step}.\n"
+                    f"non-finite PARAMETERS ({len(bad_params)}): {bad_params[:8]}"
+                    f"{' ...' if len(bad_params) > 8 else ''}\n"
+                    f"(empty list => weights healthy => THIS batch's content triggered it)\n"
+                    f"last samples built (newest last): {prov[-4:] if prov else 'none - run with NUM_WORKERS=0'}\n"
+                    f"batch saved to {dump_path} for tests/replay_nan_batch.py")
         return (outputs.loss, outputs) if return_outputs else outputs.loss
 
     def log(self, logs, start_time=None):
