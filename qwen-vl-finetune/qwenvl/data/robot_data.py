@@ -112,6 +112,16 @@ class RobotDataArguments(DataArguments):
     # language supervision (labels are fully masked).
     predict_subtask: bool = False
     subtask_question: str = "which colored block did the human hand point to?"
+    # Gate out a leading subtask segment (by its label, e.g. "waiting") from episodes:
+    # min_start moves to the segment's end+1, so its frames are never training timesteps
+    # NOR history context -- unlike DAgger's is_intervention gate, image history and past
+    # states are edge-clamped AT the cut (episode["hist_min"]), not at frame 0. Built for
+    # the human-video-prompt setup, where the leading segment shows a human pointing at
+    # the target block in the robot's own view: letting history reach into it would leak
+    # the task and bypass the prompt video (and deployment has no pointing phase at all).
+    # Labeled episodes whose first segment does NOT match are dropped with a warning (the
+    # cut cannot be located); unlabeled episodes are untouched.
+    skip_leading_subtask: str = ""
     # FAST action tokens (arXiv:2501.09747) as an extra VLM supervision signal, per the
     # knowledge-insulation recipe (arXiv:2505.23705). Requires a tokenizer fit with
     # scripts/train_fast_tokenizer.py and train_vlm=True. The encoded action chunk is
@@ -452,6 +462,21 @@ class RobotFlowMatchingDataset(Dataset):
                     if has_iv:
                         flags = np.stack(df["is_intervention"].to_numpy()).astype(np.float32).ravel() > 0.5
                         min_start = int(flags.argmax()) if flags.any() else 0
+                    # Leading-segment gate (see RobotDataArguments.skip_leading_subtask):
+                    # unlike the DAgger gate above, hist_min ALSO clamps history there.
+                    hist_min = 0
+                    segs = subtask_labels.get(video_name, [])
+                    if data_args.skip_leading_subtask and segs:
+                        if (segs[0]["task"] == data_args.skip_leading_subtask
+                                and len(segs) > 1):
+                            min_start = max(min_start, int(segs[0]["end"]) + 1)
+                            hist_min = min_start
+                        else:
+                            print(f"[RobotFlowMatchingDataset] dropping {video_name}: "
+                                  f"labels do not start with a "
+                                  f"'{data_args.skip_leading_subtask}' segment, cannot "
+                                  f"locate the cut")
+                            continue
                     if self.active_dims is not None:
                         # Slice once at load time: everything downstream (delta transform,
                         # norm stats, prompt state, chunks) lives in the selected space.
@@ -472,9 +497,10 @@ class RobotFlowMatchingDataset(Dataset):
                             "actions": actions,
                             "video_path": str(video_path),
                             "wrist_paths": wrist_paths,
-                            "subtasks": subtask_labels.get(video_name, []),
+                            "subtasks": segs,
                             "instruction": instructions.get(video_name),
                             "min_start": min_start,
+                            "hist_min": hist_min,
                         }
                     )
 
@@ -656,8 +682,13 @@ class RobotFlowMatchingDataset(Dataset):
         Decodes only the [t-(N-1)*stride, t] window (~N*stride frames) instead of the whole
         video: read_video with start_pts/end_pts returns exactly the contiguous frames
         lo..t, so global frame g maps to window-local index g-lo. Clamped duplicates near
-        the episode start reuse the same frame."""
-        lo = max(0, t - (self.num_frames - 1) * self.stride)
+        the episode start reuse the same frame.
+
+        Episodes gated by skip_leading_subtask carry hist_min > 0: the low clamp moves
+        from frame 0 to hist_min so history can never reach into the gated-out segment
+        (near the cut the first frame repeats, same as the episode-start behavior)."""
+        hist_min = int(episode.get("hist_min", 0))
+        lo = max(hist_min, t - (self.num_frames - 1) * self.stride)
         video, _, _ = read_video(
             episode["video_path"], start_pts=lo / self.fps, end_pts=(t + 0.9) / self.fps,
             pts_unit="sec", output_format="THWC",
@@ -666,11 +697,11 @@ class RobotFlowMatchingDataset(Dataset):
         if n == 0:  # empty window -> full-decode fallback
             video, _, _ = read_video(episode["video_path"], pts_unit="sec", output_format="THWC")
             total = len(video)
-            indices = [min(max(t - i * self.stride, 0), total - 1) for i in reversed(range(self.num_frames))]
+            indices = [min(max(t - i * self.stride, hist_min), total - 1) for i in reversed(range(self.num_frames))]
             return [Image.fromarray(video[i].numpy()) for i in indices]
         frames = []
         for i in reversed(range(self.num_frames)):
-            g = max(t - i * self.stride, 0)  # desired global frame (low-clamped)
+            g = max(t - i * self.stride, hist_min)  # desired global frame (low-clamped)
             local = min(max(g - lo, 0), n - 1)  # map into window (high-clamp to its end)
             frames.append(Image.fromarray(video[local].numpy()))
         return frames
@@ -761,7 +792,8 @@ class RobotFlowMatchingDataset(Dataset):
         # current state above): SAME indices and edge-clamping as _extract_frames.
         norm_past = None
         if self.data_args.state_history:
-            idxs = [max(0, t - k * self.stride) for k in range(self.num_frames - 1, 0, -1)]
+            hist_min = int(episode.get("hist_min", 0))
+            idxs = [max(hist_min, t - k * self.stride) for k in range(self.num_frames - 1, 0, -1)]
             norm_past = quantile_normalize(episode["states"][idxs], self.norm_stats["state"])
 
         # One decision per SAMPLE; each camera then gets its own parameter draw.

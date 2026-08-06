@@ -42,12 +42,19 @@ from qwenvl.data.robot_data import (
 
 
 def scan_state_actions(robot_data_dirs: str, active_dims, train_split: float,
-                       action_space: str = "joint", min_episode_len: int = 0):
+                       action_space: str = "joint", min_episode_len: int = 0,
+                       skip_leading_subtask: str = ""):
     """Load (states, actions) per episode. No video needed for tokenizer fitting.
 
     DAgger episodes (an `is_intervention` parquet column) get `min_start` = the first
     intervention frame: only the human-correction segment feeds the stats and the FAST
-    fit, mirroring the training dataset's sampling gate (robot_data.py)."""
+    fit, mirroring the training dataset's sampling gate (robot_data.py).
+
+    skip_leading_subtask mirrors the same-named RobotDataArguments gate: episodes whose
+    subtask labels start with the given segment (e.g. "waiting") get min_start = its
+    end+1; labeled episodes that don't match are dropped, unlabeled ones untouched."""
+    import json
+
     import pyarrow.parquet as papq
 
     episodes = []
@@ -56,6 +63,10 @@ def scan_state_actions(robot_data_dirs: str, active_dims, train_split: float,
         if not root.exists():
             print(f"skipping missing root {root}")
             continue
+        subtask_labels = {}
+        for labels_path in sorted((root / "videos").glob("chunk-*/subtask_labels.json")):
+            with open(labels_path) as f:
+                subtask_labels.update(json.load(f))
         per_root = []
         for chunk_dir in sorted((root / "data").glob("chunk-*")):
             for pq in sorted(chunk_dir.glob("episode_*.parquet")):
@@ -69,6 +80,14 @@ def scan_state_actions(robot_data_dirs: str, active_dims, train_split: float,
                 if has_iv:
                     flags = np.stack(df["is_intervention"].to_numpy()).astype(np.float32).ravel() > 0.5
                     min_start = int(flags.argmax()) if flags.any() else 0
+                segs = subtask_labels.get(pq.stem + ".mp4", [])
+                if skip_leading_subtask and segs:
+                    if segs[0]["task"] == skip_leading_subtask and len(segs) > 1:
+                        min_start = max(min_start, int(segs[0]["end"]) + 1)
+                    else:
+                        print(f"dropping {pq.stem}: labels do not start with a "
+                              f"'{skip_leading_subtask}' segment, cannot locate the cut")
+                        continue
                 if active_dims is not None:
                     states, actions = states[:, active_dims], actions[:, active_dims]
                 if min_episode_len and len(states) < min_episode_len:
@@ -99,6 +118,10 @@ def main():
                          "representation before stats/fit (see qwenvl/data/ee_repr.py)")
     ap.add_argument("--min_episode_len", type=int, default=0,
                     help="skip episodes shorter than this (match the training filter)")
+    ap.add_argument("--skip_leading_subtask", default="",
+                    help="gate out a leading subtask segment by label (e.g. 'waiting'); "
+                         "must match the training run's --skip_leading_subtask so the "
+                         "stats/fit cover exactly the trainable timesteps")
     ap.add_argument("--vocab_size", type=int, default=1024)
     ap.add_argument("--scale", type=float, default=10.0, help="FAST DCT scale (tokenizer default 10); higher = finer quantization / more tokens")
     ap.add_argument("--max_chunks", type=int, default=500_000,
@@ -111,7 +134,8 @@ def main():
     delta_mask = make_delta_mask(args.delta_mask) if args.use_delta_actions else None
 
     episodes = scan_state_actions(args.robot_data_dirs, active_dims, args.train_split,
-                                  args.action_space, args.min_episode_len)
+                                  args.action_space, args.min_episode_len,
+                                  args.skip_leading_subtask)
     if not episodes:
         raise ValueError(f"No episodes under {args.robot_data_dirs}")
     print(f"scanned {len(episodes)} episodes")
