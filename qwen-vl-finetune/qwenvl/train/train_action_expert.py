@@ -218,17 +218,21 @@ class EmbedNanWatchCallback(transformers.TrainerCallback):
         # clean here (backward writes grads, not params) and the GRAD tells us whether
         # the optimizer is about to be fed non-finite values for the head rows.
         self._check(state, "after backwards, BEFORE optimizer step")
+        g = None
         try:
+            # Best-effort: some DeepSpeed versions refuse grad access at this hook point
+            # ("Gradients are only available immediately after backward..."). The weight
+            # scans above/below are the load-bearing instrument; this probe is a bonus.
             from deepspeed.utils import safe_get_full_grad
             g = safe_get_full_grad(self._emb.weight)
-            if g is not None and not torch.isfinite(g[:16]).all():
-                bad = (~torch.isfinite(g[:16]).all(dim=1)).nonzero().flatten().tolist()
-                raise RuntimeError(
-                    f"[EmbedNanWatch] embed GRAD rows {bad} non-finite before optimizer "
-                    f"step (global_step {state.global_step}): the backward produced them; "
-                    f"the optimizer step would smear them into the weights.")
-        except ImportError:
+        except Exception:
             pass
+        if g is not None and not torch.isfinite(g[:16]).all():
+            bad = (~torch.isfinite(g[:16]).all(dim=1)).nonzero().flatten().tolist()
+            raise RuntimeError(
+                f"[EmbedNanWatch] embed GRAD rows {bad} non-finite before optimizer "
+                f"step (global_step {state.global_step}): the backward produced them; "
+                f"the optimizer step would smear them into the weights.")
 
     def on_step_end(self, args, state, control, **kwargs):
         self._check(state, "after optimizer step")
