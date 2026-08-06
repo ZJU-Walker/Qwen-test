@@ -167,6 +167,40 @@ class ActionExpertTrainer(Trainer):
         return super().log(logs, start_time)
 
 
+class EmbedNanWatchCallback(transformers.TrainerCallback):
+    """QWEN_NAN_DEBUG aid: scan the (tied) token-embedding table once at train begin and
+    after EVERY optimizer step; crash the moment corruption appears. Pinpoints WHICH
+    update wrote non-finite values, into WHICH rows (new FAST/marker tokens start at the
+    old vocab size), and whether they are inf (overflow) or nan (e.g. inf*0 clip scale).
+    Cost: one isfinite reduction over the embedding per step (~ms)."""
+
+    def __init__(self, model):
+        m = model
+        while hasattr(m, "module"):
+            m = m.module
+        self._emb = m.vlm.model.language_model.embed_tokens
+        self._head = m.vlm.lm_head
+
+    def _check(self, state, where):
+        w = self._emb.weight
+        bad_rows = ~torch.isfinite(w).all(dim=1)
+        if bad_rows.any():
+            ids = bad_rows.nonzero().flatten()
+            first_bad_vals = w[ids[0]][~torch.isfinite(w[ids[0]])][:6]
+            raise RuntimeError(
+                f"[EmbedNanWatch] {int(bad_rows.sum())} non-finite embedding rows {where} "
+                f"(global_step {state.global_step}): row ids {ids[:16].tolist()}"
+                f"{' ...' if len(ids) > 16 else ''} | sample bad values "
+                f"{first_bad_vals.float().tolist()} | "
+                f"tied_head={self._head.weight is w}")
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._check(state, "AT INIT, before any update")
+
+    def on_step_end(self, args, state, control, **kwargs):
+        self._check(state, "after optimizer step")
+
+
 class ExpertEMACallback(transformers.TrainerCallback):
     """EMA (exponential moving average) of the from-scratch parameters -- the expert
     transformer + flow heads (everything not prefixed 'vlm.').
@@ -483,6 +517,8 @@ def train(attn_implementation="flash_attention_2"):
     if model_args.ema_decay > 0:
         # After init_from so the shadow starts from the warm-started weights.
         trainer.add_callback(ExpertEMACallback(model, decay=model_args.ema_decay))
+    if os.environ.get("QWEN_NAN_DEBUG"):
+        trainer.add_callback(EmbedNanWatchCallback(model))
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         logging.info("checkpoint found, resume training")
