@@ -143,6 +143,13 @@ class RobotDataArguments(DataArguments):
     # during training, so the prompt-swap success test measures reading an UNSEEN demo,
     # not recognizing a memorized one.
     human_prompt_holdout: int = 4
+    # Virtual epoch length: __len__ reports num_episodes * this. Every item is an
+    # independent (episode, random timestep, random prompt, random aug) draw, so "epoch"
+    # has no statistical meaning -- but the dataloader restarts its prefetch pipeline at
+    # every epoch boundary, and with a few hundred episodes that stall recurs every
+    # handful of optimizer steps and starves the GPU. Raise (e.g. 50) to make boundaries
+    # rare; the sampling distribution is unchanged.
+    dataset_epoch_multiplier: int = 1
     # FAST action tokens (arXiv:2501.09747) as an extra VLM supervision signal, per the
     # knowledge-insulation recipe (arXiv:2505.23705). Requires a tokenizer fit with
     # scripts/train_fast_tokenizer.py and train_vlm=True. The encoded action chunk is
@@ -761,19 +768,21 @@ class RobotFlowMatchingDataset(Dataset):
     # Sampling
     # ------------------------------------------------------------------
     def __len__(self):
-        return len(self.episodes)
+        # Virtual length (see dataset_epoch_multiplier): item i maps to episode
+        # i % num_episodes in _build_item.
+        return len(self.episodes) * max(1, int(getattr(self.data_args, "dataset_epoch_multiplier", 1)))
 
     @property
     def lengths(self):
-        return [1] * len(self.episodes)
+        return [1] * len(self)
 
     @property
     def modality_lengths(self):
-        return [1] * len(self.episodes)
+        return [1] * len(self)
 
     @property
     def pre_calculated_length(self):
-        return np.array([1] * len(self.episodes))
+        return np.array([1] * len(self))
 
     def _extract_frames(self, episode: Dict, t: int) -> List[Image.Image]:
         """A `num_frames`-frame history ending at t, spaced by `stride` (oldest->newest),
@@ -877,7 +886,7 @@ class RobotFlowMatchingDataset(Dataset):
         return self.data_args.default_prompt
 
     def _build_item(self, idx: int) -> Dict[str, torch.Tensor]:
-        episode = self.episodes[idx]
+        episode = self.episodes[idx % len(self.episodes)]
         num_steps = len(episode["states"])
         # min_start > 0 on DAgger episodes: only the human-correction segment may be a
         # training timestep. _extract_frames still gets the raw t, so the image history

@@ -122,6 +122,9 @@ args=(
     --state_history True
     # ---- the human-video-prompt setup ----
     --skip_leading_subtask waiting
+    # 223-sample "epochs" are ~3.5 optimizer steps; the dataloader pipeline restart at
+    # every boundary starves the GPU. Virtual epochs make boundaries ~50x rarer.
+    --dataset_epoch_multiplier 50
     --human_prompt_dirs "$HUMAN_PROMPT_DIRS"
     --human_prompt_stride 10
     --human_prompt_max_frames 12
@@ -165,6 +168,7 @@ args=(
     --model_max_length 8192
     --gradient_checkpointing True
     --dataloader_num_workers "${NUM_WORKERS:-4}"
+    --dataloader_prefetch_factor 4
     # persistent_workers requires num_workers > 0 (NUM_WORKERS=0 is the nan-debug mode:
     # in-process data loading so the provenance ring buffer is visible to the trainer).
     --dataloader_persistent_workers "$([ "${NUM_WORKERS:-4}" -gt 0 ] && echo True || echo False)"
