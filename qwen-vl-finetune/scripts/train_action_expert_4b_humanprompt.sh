@@ -32,6 +32,8 @@ export TRITON_CACHE_DIR="$CUSTOM_CACHE_DIR/triton"
 # wandb's service handshake writes a port file under TMPDIR; NFS home breaks it.
 export TMPDIR=/tmp
 export PYTHONUNBUFFERED=1
+# Long-sequence runs fragment the allocator; expandable segments reclaim the slack.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
@@ -41,7 +43,9 @@ NPROC_PER_NODE=${NPROC_PER_NODE:-2}
 
 # Effective batch is FIXED at 64 regardless of GPU count (accumulation derived).
 TARGET_BATCH=64
-PER_DEVICE_BATCH=4
+# 2 (not the ee6d recipe's 4): the human-prompt clip is a second video, sequences are
+# ~1600 tokens vs ~1000, and 4-per-device OOMs an H200 by ~5 GB during backward.
+PER_DEVICE_BATCH=2
 if [ $((TARGET_BATCH % (PER_DEVICE_BATCH * NPROC_PER_NODE))) -ne 0 ]; then
     echo "ERROR: TARGET_BATCH=$TARGET_BATCH not divisible by $PER_DEVICE_BATCH x $NPROC_PER_NODE GPUs" >&2
     exit 1
