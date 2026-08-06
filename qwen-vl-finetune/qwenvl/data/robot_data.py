@@ -122,6 +122,27 @@ class RobotDataArguments(DataArguments):
     # Labeled episodes whose first segment does NOT match are dropped with a warning (the
     # cut cannot be located); unlabeled episodes are untouched.
     skip_leading_subtask: str = ""
+    # ---- human-video-prompt conditioning ----
+    # "key=path" pairs, comma-separated: each LeRobot root holds human demonstration
+    # videos for the tasks whose subtask label CONTAINS the key, e.g.
+    #   "green=/data/green_human_prompt,yellow=/data/yellow_human_prompt".
+    # When set, every sample prepends a randomly drawn same-task human demo clip as a
+    # SECOND video ("Human demonstration:" ... "Robot view:" ...): fresh pairing on every
+    # draw, so the model cannot memorize demo<->episode associations and must read the
+    # demo's content. Combine with skip_leading_subtask when the robot episodes contain
+    # an in-scene instruction phase (e.g. pointing) that would leak the task.
+    human_prompt_dirs: str = ""
+    # Prompt-clip sampling: every `human_prompt_stride`th frame -- keep it equal to
+    # frame_stride so both videos share the M-RoPE seconds-per-frame truthfully -- with
+    # the final frame (the grasp outcome) always included, uniformly re-spaced down to
+    # `human_prompt_max_frames` when over. Input-shape contract: stamped into
+    # visual_budget.json; serve-time prompt sampling must match.
+    human_prompt_stride: int = 10
+    human_prompt_max_frames: int = 12
+    # Reserve the LAST N videos (sorted order) of each pool for evaluation: never drawn
+    # during training, so the prompt-swap success test measures reading an UNSEEN demo,
+    # not recognizing a memorized one.
+    human_prompt_holdout: int = 4
     # FAST action tokens (arXiv:2501.09747) as an extra VLM supervision signal, per the
     # knowledge-insulation recipe (arXiv:2505.23705). Requires a tokenizer fit with
     # scripts/train_fast_tokenizer.py and train_vlm=True. The encoded action chunk is
@@ -322,6 +343,8 @@ class RobotFlowMatchingDataset(Dataset):
             raise ValueError(f"No usable episodes found under: {data_args.robot_data_dirs}")
         print(f"[RobotFlowMatchingDataset] {len(self.episodes)} training episodes")
 
+        self.human_prompt_pools = self._scan_human_prompts(data_args)
+
         # fps for windowed single-frame wrist decode (avoids full-decoding the video).
         first_root = Path(data_args.robot_data_dirs.split(",")[0].strip())
         info_path = first_root / "meta" / "info.json"
@@ -386,6 +409,68 @@ class RobotFlowMatchingDataset(Dataset):
             f"[RobotFlowMatchingDataset] FAST enabled: vocab {self.fast_vocab_size}, "
             f"base id {self.fast_base_id}, new tokenizer size {self.vlm_vocab_size}"
         )
+
+    # ------------------------------------------------------------------
+    # Human-prompt video pools (see RobotDataArguments.human_prompt_dirs)
+    # ------------------------------------------------------------------
+    def _scan_human_prompts(self, data_args: RobotDataArguments):
+        """Build {key: [video paths]} pools of human demo clips and verify every robot
+        episode's subtask labels match exactly one pool key. Returns None when off."""
+        if not data_args.human_prompt_dirs:
+            return None
+        pools = {}
+        for spec in data_args.human_prompt_dirs.split(","):
+            spec = spec.strip()
+            if not spec:
+                continue
+            key, _, root_str = spec.partition("=")
+            key, root = key.strip(), Path(root_str.strip())
+            if not root_str or not key:
+                raise ValueError(f"human_prompt_dirs entry {spec!r} is not 'key=path'")
+            vids = []
+            for chunk_dir in sorted((root / "videos").glob("chunk-*")):
+                cam_dir = chunk_dir / f"observation.images.{data_args.camera}"
+                vids.extend(sorted(cam_dir.glob("episode_*.mp4")))
+            if not vids:
+                raise ValueError(f"no {data_args.camera} videos under {root}")
+            holdout = data_args.human_prompt_holdout
+            train_vids = vids[:-holdout] if 0 < holdout < len(vids) else vids
+            pools[key] = [str(v) for v in train_vids]
+            print(f"[RobotFlowMatchingDataset] human-prompt pool '{key}': "
+                  f"{len(train_vids)} train clips ({len(vids) - len(train_vids)} held out) "
+                  f"from {root}")
+        self.human_prompt_pools = pools  # _human_prompt_key reads it during validation
+        unmatched = [Path(ep["video_path"]).name for ep in self.episodes
+                     if self._human_prompt_key(ep) is None]
+        if unmatched:
+            raise ValueError(
+                f"{len(unmatched)} episodes have no subtask label containing any human-"
+                f"prompt pool key {sorted(pools)} (first: {unmatched[:3]}); cannot pair "
+                "a demo video. Fix the keys or the labels.")
+        return pools
+
+    def _human_prompt_key(self, episode: Dict) -> Optional[str]:
+        for segment in episode.get("subtasks", []):
+            for key in self.human_prompt_pools:
+                if key in segment["task"]:
+                    return key
+        return None
+
+    def _extract_human_prompt(self, episode: Dict) -> List[Image.Image]:
+        """A same-task human demo clip, freshly drawn per call. Full-clip decode is fine:
+        prompt recordings are a few seconds. Stride-sampled with the final frame (the
+        grasp outcome) forced in; uniformly re-spaced when over max_frames."""
+        path = random.choice(self.human_prompt_pools[self._human_prompt_key(episode)])
+        video, _, _ = read_video(path, pts_unit="sec", output_format="THWC")
+        total = len(video)
+        idxs = list(range(0, total, self.data_args.human_prompt_stride))
+        if idxs[-1] != total - 1:
+            idxs.append(total - 1)
+        max_frames = self.data_args.human_prompt_max_frames
+        if len(idxs) > max_frames:
+            sel = np.linspace(0, len(idxs) - 1, max_frames)
+            idxs = [idxs[int(round(s))] for s in sel]
+        return [Image.fromarray(video[i].numpy()) for i in idxs]
 
     # ------------------------------------------------------------------
     # Episode discovery
@@ -838,6 +923,17 @@ class RobotFlowMatchingDataset(Dataset):
             content = [{"type": "image", "image": top_img}]
         content += [{"type": "image", "image": img} for img in wrist_images]
         content.append({"type": "text", "text": prompt})
+        if self.human_prompt_pools is not None:
+            # Freshly drawn same-task human demo as a FIRST video, with structural text
+            # markers so the two videos are unambiguous. Independent augmentation draw
+            # (same per-clip convention as the other cameras). Serve must build the
+            # identical structure (inference.templatize).
+            prompt_frames = self._extract_human_prompt(episode)
+            if aug_on:
+                prompt_frames = self._augment(prompt_frames, geometric=True)
+            content = [{"type": "text", "text": "Human demonstration:"},
+                       {"type": "video", "video": prompt_frames},
+                       {"type": "text", "text": "Robot view:"}] + content
         messages = [{"role": "user", "content": content}]
         if assistant_text is not None:
             messages.append({"role": "assistant", "content": [{"type": "text", "text": assistant_text}]})

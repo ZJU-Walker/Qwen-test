@@ -281,6 +281,10 @@ def train(attn_implementation="flash_attention_2"):
             # Whether the prompt carries the frame-aligned past states ("Past states:") --
             # an input-shape contract like the above: serving must build the same prompt.
             "state_history",
+            # Human-video-prompt conditioning: serving must prepend the demo clip with
+            # the same structure and sampling (dirs non-empty <=> mode on; the dirs
+            # themselves are irrelevant at serve time -- the demo arrives per request).
+            "human_prompt_dirs", "human_prompt_stride", "human_prompt_max_frames",
         )},
             # Whether the expert attended the subtask turn in training. Attention-mask-only
             # (identical state_dict either way), so a mismatched serve loads cleanly and
