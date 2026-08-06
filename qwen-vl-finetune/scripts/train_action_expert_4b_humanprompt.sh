@@ -164,6 +164,10 @@ args=(
     --gradient_checkpointing True
     --dataloader_num_workers "${NUM_WORKERS:-4}"
     --dataloader_persistent_workers True
+    # 223 samples/epoch with per-device 2 leaves a batch-of-1 tail each epoch; that
+    # singleton hit a mixed-attention-mask edge case (fully-masked rows -> nan CE that
+    # poisoned the weights at epoch 1.0). Dropping the tail costs <=1 random sample/epoch.
+    --dataloader_drop_last True
     --run_name "$RUN_NAME"
     --report_to wandb
 )
