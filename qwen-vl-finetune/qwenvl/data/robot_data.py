@@ -457,21 +457,35 @@ class RobotFlowMatchingDataset(Dataset):
         return None
 
     def _extract_human_prompt(self, episode: Dict) -> List[Image.Image]:
-        """A same-task human demo clip, freshly drawn per call. Full-clip decode is fine:
-        prompt recordings are a few seconds. Stride-sampled with the final frame (the
-        grasp outcome) forced in; uniformly re-spaced when over max_frames."""
+        """A same-task human demo clip, freshly drawn per call. Stride-sampled with the
+        final frame (the grasp outcome) forced in; uniformly re-spaced when over
+        max_frames.
+
+        The sampled frames are CACHED per clip (per dataloader worker): the pools hold
+        only a few dozen clips, each ~3 s, yet every sample draws one -- without the
+        cache the repeated full-clip decodes dominate the dataloader and starve the GPU.
+        Sampling indices are deterministic per clip, so the cache is exact (~1 MB/frame,
+        ~600 MB/worker for 55 clips x 12 frames). Only the random DRAW and the
+        augmentation vary per sample, and _augment returns new images, so sharing the
+        cached PIL frames is safe."""
         path = random.choice(self.human_prompt_pools[self._human_prompt_key(episode)])
         self._last_prompt_path = path  # provenance for the QWEN_NAN_DEBUG ring buffer
-        video, _, _ = read_video(path, pts_unit="sec", output_format="THWC")
-        total = len(video)
-        idxs = list(range(0, total, self.data_args.human_prompt_stride))
-        if idxs[-1] != total - 1:
-            idxs.append(total - 1)
-        max_frames = self.data_args.human_prompt_max_frames
-        if len(idxs) > max_frames:
-            sel = np.linspace(0, len(idxs) - 1, max_frames)
-            idxs = [idxs[int(round(s))] for s in sel]
-        return [Image.fromarray(video[i].numpy()) for i in idxs]
+        if not hasattr(self, "_prompt_clip_cache"):
+            self._prompt_clip_cache = {}
+        frames = self._prompt_clip_cache.get(path)
+        if frames is None:
+            video, _, _ = read_video(path, pts_unit="sec", output_format="THWC")
+            total = len(video)
+            idxs = list(range(0, total, self.data_args.human_prompt_stride))
+            if idxs[-1] != total - 1:
+                idxs.append(total - 1)
+            max_frames = self.data_args.human_prompt_max_frames
+            if len(idxs) > max_frames:
+                sel = np.linspace(0, len(idxs) - 1, max_frames)
+                idxs = [idxs[int(round(s))] for s in sel]
+            frames = [Image.fromarray(video[i].numpy()) for i in idxs]
+            self._prompt_clip_cache[path] = frames
+        return list(frames)
 
     # ------------------------------------------------------------------
     # Episode discovery
