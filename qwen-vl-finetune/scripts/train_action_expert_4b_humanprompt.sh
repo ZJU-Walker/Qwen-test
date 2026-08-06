@@ -32,8 +32,10 @@ export TRITON_CACHE_DIR="$CUSTOM_CACHE_DIR/triton"
 # wandb's service handshake writes a port file under TMPDIR; NFS home breaks it.
 export TMPDIR=/tmp
 export PYTHONUNBUFFERED=1
-# Long-sequence runs fragment the allocator; expandable segments reclaim the slack.
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# DO NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here: with DeepSpeed
+# overlap_comm (async side-stream gradient reduction) it silently corrupted parameter
+# memory -- exactly 50 KiB of nan over embed_tokens rows 0-9, deterministically at
+# optimizer step 3 (2026-08-06; see EmbedNanWatchCallback / QWEN_NAN_DEBUG).
 
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
