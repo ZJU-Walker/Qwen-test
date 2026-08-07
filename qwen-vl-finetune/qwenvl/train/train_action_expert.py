@@ -27,6 +27,17 @@ from qwenvl.action_expert import ActionExpertConfig, Qwen3VLWithActionExpert
 from qwenvl.data.robot_data import RobotDataArguments, make_robot_data_module
 from qwenvl.train.argument import TrainingArguments
 
+# QWEN_STALL_DEBUG=1: every 90s, append ALL thread stacks of this rank to
+# /tmp/qwen_stall_rank<R>.log (in-process faulthandler -- works where ptrace/py-spy is
+# forbidden). After a hang, the newest block in each rank's file shows the exact line
+# it is stuck on. Armed at import so the model-load / DS-init phases are covered too.
+if os.environ.get("QWEN_STALL_DEBUG"):
+    import faulthandler
+    _stall_log = open(f"/tmp/qwen_stall_rank{os.environ.get('RANK', '0')}.log", "a")
+    _stall_log.write(f"\n===== new run pid={os.getpid()} =====\n")
+    _stall_log.flush()
+    faulthandler.dump_traceback_later(90, repeat=True, file=_stall_log)
+
 
 @dataclass
 class ActionExpertModelArguments:
