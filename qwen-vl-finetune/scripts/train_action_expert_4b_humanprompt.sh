@@ -32,6 +32,12 @@ export TRITON_CACHE_DIR="$CUSTOM_CACHE_DIR/triton"
 # wandb's service handshake writes a port file under TMPDIR; NFS home breaks it.
 export TMPDIR=/tmp
 export PYTHONUNBUFFERED=1
+# NCCL collective fuse. Observed (locally AND on Modal -- same signature both sites):
+# rank-0-only filesystem work (wandb log writes, input dumps, checkpoint saves; NFS
+# stalls locally, volume commits on Modal) can block rank 0 past the bare 600s NCCL
+# default while the other ranks wait in the next grad all-reduce -- the watchdog then
+# kills a healthy run. Both knobs, since the PG init path ignored the usual defaults.
+export DEEPSPEED_TIMEOUT=${DEEPSPEED_TIMEOUT:-120}   # minutes
 # DO NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here: with DeepSpeed
 # overlap_comm (async side-stream gradient reduction) it silently corrupted parameter
 # memory -- exactly 50 KiB of nan over embed_tokens rows 0-9, deterministically at
@@ -93,7 +99,9 @@ EMA_DECAY=0.999
 OUTPUT_DIR="${OUTPUT_DIR}_constlr"
 RUN_NAME="${RUN_NAME}_constlr"
 
-export QWEN_DUMP_MODEL_INPUTS="${OUTPUT_DIR}/input_dumps"
+# Overridable incl. explicit-empty (QWEN_DUMP_MODEL_INPUTS= disables the dumps --
+# on Modal they'd write PNGs to the volume, whose periodic commits can stall writers).
+export QWEN_DUMP_MODEL_INPUTS="${QWEN_DUMP_MODEL_INPUTS-${OUTPUT_DIR}/input_dumps}"
 export QWEN_DUMP_MODEL_INPUTS_N=2
 
 args=(
@@ -165,6 +173,7 @@ args=(
     --weight_decay 0
     --max_grad_norm 1
     --logging_steps 1
+    --ddp_timeout 7200
     --model_max_length 8192
     --gradient_checkpointing True
     --dataloader_num_workers "${NUM_WORKERS:-4}"
