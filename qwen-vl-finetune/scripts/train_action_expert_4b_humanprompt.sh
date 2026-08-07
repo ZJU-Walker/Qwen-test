@@ -38,6 +38,11 @@ export PYTHONUNBUFFERED=1
 # default while the other ranks wait in the next grad all-reduce -- the watchdog then
 # kills a healthy run. Both knobs, since the PG init path ignored the usual defaults.
 export DEEPSPEED_TIMEOUT=${DEEPSPEED_TIMEOUT:-120}   # minutes
+# wandb appends its run files every logged step (logging_steps 1): keep that off NFS
+# so it can never stall rank 0 (metrics still sync to the wandb cloud dashboard).
+# Pre-set WANDB_DIR (e.g. Modal) wins.
+export WANDB_DIR="${WANDB_DIR:-/tmp/qwen_wandb}"
+mkdir -p "$WANDB_DIR"
 # DO NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here: with DeepSpeed
 # overlap_comm (async side-stream gradient reduction) it silently corrupted parameter
 # memory -- exactly 50 KiB of nan over embed_tokens rows 0-9, deterministically at
