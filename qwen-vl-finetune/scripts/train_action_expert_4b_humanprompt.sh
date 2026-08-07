@@ -104,6 +104,13 @@ EMA_DECAY=0.999
 OUTPUT_DIR="${OUTPUT_DIR}_constlr"
 RUN_NAME="${RUN_NAME}_constlr"
 
+# RUN_TAG: suffix for concurrent variants (e.g. RUN_TAG=1gpu alongside the 2-GPU run
+# on another allocation) -- separate checkpoints dir + wandb run, identical recipe.
+if [ -n "${RUN_TAG:-}" ]; then
+    OUTPUT_DIR="${OUTPUT_DIR}_${RUN_TAG}"
+    RUN_NAME="${RUN_NAME}_${RUN_TAG}"
+fi
+
 # Overridable incl. explicit-empty (QWEN_DUMP_MODEL_INPUTS= disables the dumps --
 # on Modal they'd write PNGs to the volume, whose periodic commits can stall writers).
 export QWEN_DUMP_MODEL_INPUTS="${QWEN_DUMP_MODEL_INPUTS-${OUTPUT_DIR}/input_dumps}"
