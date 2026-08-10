@@ -7,12 +7,18 @@ cd "$(dirname "$0")/.." || exit
 # HUMAN-VIDEO-PROMPT run (2026-08-06): the language instruction is replaced by a short
 # human demonstration clip. Recipe = the ee6d constant-lr recipe on gated 0717 merged:
 #
-#   * DATA: 0717 merged (224 eps; human points -> robot picks), with the pointing phase
-#     gated OUT via --skip_leading_subtask waiting: the "waiting" segment is never a
-#     training timestep NOR history context (hist_min clamp -- unlike DAgger, history
-#     must not reach into it: it shows the human pointing at the target in the robot's
-#     own view and would leak the task past the prompt video). ep 149 auto-dropped
-#     (mislabeled). Norm stats + FAST fit under the same gate (frozen artifact below).
+#   * DATA: 0717 merged (224 eps) + 0731 merged (224 eps) -- both are block-memory
+#     format (human points -> robot picks), with the pointing phase gated OUT via
+#     --skip_leading_subtask waiting: the "waiting" segment is never a training
+#     timestep NOR history context (hist_min clamp -- unlike DAgger, history must not
+#     reach into it: it shows the human pointing at the target in the robot's own view
+#     and would leak the task past the prompt video). 0717 ep 149 auto-dropped
+#     (mislabeled); seven unusable 0731 recordings are waiting-only (128/129/130/133/
+#     150/152/153), leaving 217 usable and 440 total with 0717.
+#     0731 labels are proprioception-generated (validated on
+#     0717 human labels, colors cross-checked vs brian's independent run) -- install
+#     them first: python tests/gen_0731_subtask_labels.py --install
+#     Norm stats + FAST fit under the same gate on BOTH datasets (frozen artifact below).
 #   * HUMAN PROMPT: per sample, a random same-color human demo clip (green pool 31-4,
 #     yellow pool 32-4; last 4 of each held out for eval) is prepended as a SECOND video
 #     ("Human demonstration:" <clip> "Robot view:" <history> ...). Fresh pairing every
@@ -32,11 +38,17 @@ export TRITON_CACHE_DIR="$CUSTOM_CACHE_DIR/triton"
 # wandb's service handshake writes a port file under TMPDIR; NFS home breaks it.
 export TMPDIR=/tmp
 export PYTHONUNBUFFERED=1
-# NCCL collective fuse. Observed (locally AND on Modal -- same signature both sites):
-# rank-0-only filesystem work (wandb log writes, input dumps, checkpoint saves; NFS
-# stalls locally, volume commits on Modal) can block rank 0 past the bare 600s NCCL
-# default while the other ranks wait in the next grad all-reduce -- the watchdog then
-# kills a healthy run. Both knobs, since the PG init path ignored the usual defaults.
+# An uninstrumented FlashAttention run once died with a native SIGSEGV at step 267, so
+# use PyTorch SDPA as the conservative default while that one-off remains unexplained.
+# Later FA2 and SDPA reproductions were both caused by QWEN_STALL_DEBUG's old periodic
+# all-thread dump, not by their attention kernels. Override for an explicit FA2 run with
+# QWEN_ATTN_IMPL=flash_attention_2.
+export QWEN_ATTN_IMPL="${QWEN_ATTN_IMPL:-sdpa}"
+# Generous collective fuse for genuinely slow initialization/checkpoint I/O. The former
+# step-1 timeout was not an I/O stall: QWEN_NAN_DEBUG called ZeRO-2 safe_get_full_grad(),
+# whose rank-asymmetric failure path mismatched a 390,899,200-element all-reduce with the
+# Trainer metric gather. That callback now skips the collective whenever world_size > 1.
+# Keep both timeout knobs because the PG initialization paths do not share one default.
 export DEEPSPEED_TIMEOUT=${DEEPSPEED_TIMEOUT:-120}   # minutes
 # wandb appends its run files every logged step (logging_steps 1): keep that off NFS
 # so it can never stall rank 0 (metrics still sync to the wandb cloud dashboard).
@@ -66,12 +78,12 @@ fi
 GRAD_ACCUM=$((TARGET_BATCH / (PER_DEVICE_BATCH * NPROC_PER_NODE)))
 
 MODEL_PATH="Qwen/Qwen3-VL-4B-Instruct"
-OUTPUT_DIR="/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/qwen3_4b_ae_humanprompt_0717m_ee6d"
+OUTPUT_DIR="/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/qwen3_4b_ae_humanprompt_0717m0731_ee6d"
 CACHE_DIR="$CUSTOM_CACHE_DIR/huggingface"
-ROBOT_DATA_DIRS="/iris/projects/humanoid/trossen_data/0717_green_yellow_block_mem_merged"
+ROBOT_DATA_DIRS="/iris/projects/humanoid/trossen_data/0717_green_yellow_block_mem_merged,/iris/projects/humanoid/trossen_data/0731_green_yellow_merged"
 HUMAN_PROMPT_DIRS="green=/iris/projects/humanoid/trossen_data/green_human_prompt,yellow=/iris/projects/humanoid/trossen_data/yellow_human_prompt"
-FAST_TOKENIZER="/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/fast_tokenizer_trossen_0717m_ee6d_gated"
-RUN_NAME="qwen3vl_4b_ae_humanprompt_0717m_ee6d_bs64"
+FAST_TOKENIZER="/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/fast_tokenizer_trossen_0717m0731_ee6d_gated"
+RUN_NAME="qwen3vl_4b_ae_humanprompt_0717m0731_ee6d_bs64"
 
 # Training-time RTC prefix d ~ Uniform[0, max]; 10 matches the deployed delay of 8-10.
 RTC_MAX_DELAY=10
@@ -142,7 +154,7 @@ args=(
     --state_history True
     # ---- the human-video-prompt setup ----
     --skip_leading_subtask waiting
-    # 223-sample "epochs" are ~3.5 optimizer steps; the dataloader pipeline restart at
+    # 440-sample "epochs" are ~7 optimizer steps; the dataloader pipeline restart at
     # every boundary starves the GPU. Virtual epochs make boundaries ~50x rarer.
     --dataset_epoch_multiplier 50
     --human_prompt_dirs "$HUMAN_PROMPT_DIRS"

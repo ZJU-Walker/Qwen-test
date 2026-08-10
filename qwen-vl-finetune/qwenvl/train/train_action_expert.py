@@ -7,8 +7,10 @@ Launch with scripts/train_action_expert_4b.sh.
 import json
 import logging
 import math
+import multiprocessing
 import os
 import pathlib
+import signal
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -27,16 +29,22 @@ from qwenvl.action_expert import ActionExpertConfig, Qwen3VLWithActionExpert
 from qwenvl.data.robot_data import RobotDataArguments, make_robot_data_module
 from qwenvl.train.argument import TrainingArguments
 
-# QWEN_STALL_DEBUG=1: every 90s, append ALL thread stacks of this rank to
+# QWEN_STALL_DEBUG=1: SIGUSR1 appends ALL thread stacks of this rank to
 # /tmp/qwen_stall_rank<R>.log (in-process faulthandler -- works where ptrace/py-spy is
-# forbidden). After a hang, the newest block in each rank's file shows the exact line
-# it is stuck on. Armed at import so the model-load / DS-init phases are covered too.
-if os.environ.get("QWEN_STALL_DEBUG"):
+# forbidden). Fatal-signal tracebacks (including SIGSEGV) go to the same file. Dumps are
+# deliberately on demand: dump_traceback_later(repeat=True) itself reproducibly killed
+# rank 0 while walking its threads on the 90-second tick (2026-08-07).
+# Arm only the two rank processes: spawned dataloader workers import this module too,
+# and previously all of them wrote interleaved dumps into their parent's rank log.
+if (os.environ.get("QWEN_STALL_DEBUG")
+        and multiprocessing.current_process().name == "MainProcess"):
     import faulthandler
     _stall_log = open(f"/tmp/qwen_stall_rank{os.environ.get('RANK', '0')}.log", "a")
     _stall_log.write(f"\n===== new run pid={os.getpid()} =====\n")
+    _stall_log.write("Send SIGUSR1 to this pid for an on-demand all-thread dump.\n")
     _stall_log.flush()
-    faulthandler.dump_traceback_later(90, repeat=True, file=_stall_log)
+    faulthandler.enable(file=_stall_log, all_threads=True)
+    faulthandler.register(signal.SIGUSR1, file=_stall_log, all_threads=True, chain=False)
 
 
 @dataclass
@@ -229,11 +237,16 @@ class EmbedNanWatchCallback(transformers.TrainerCallback):
         # clean here (backward writes grads, not params) and the GRAD tells us whether
         # the optimizer is about to be fed non-finite values for the head rows.
         self._check(state, "after backwards, BEFORE optimizer step")
+        # DeepSpeed's ZeRO-2 safe_get_full_grad() is a full-parameter all-reduce. Its
+        # availability can differ by rank at this hook (one rank may raise while another
+        # enters the collective), which deadlocks the process group. The replicated
+        # weight checks above and in on_step_end remain safe and are the load-bearing
+        # diagnostics; keep this optional gradient probe single-rank only.
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            return
         g = None
         try:
-            # Best-effort: some DeepSpeed versions refuse grad access at this hook point
-            # ("Gradients are only available immediately after backward..."). The weight
-            # scans above/below are the load-bearing instrument; this probe is a bonus.
+            # Best-effort: some DeepSpeed versions refuse grad access at this hook point.
             from deepspeed.utils import safe_get_full_grad
             g = safe_get_full_grad(self._emb.weight)
         except Exception:
@@ -391,7 +404,14 @@ def train(attn_implementation="flash_attention_2"):
             # the same structure and sampling (dirs non-empty <=> mode on; the dirs
             # themselves are irrelevant at serve time -- the demo arrives per request).
             "human_prompt_dirs", "human_prompt_stride", "human_prompt_max_frames",
+            # Exact text is part of the token-level input contract. The first
+            # human-prompt checkpoint predates this key (serving has a compatibility
+            # fallback), but all new checkpoints must carry it explicitly.
+            "subtask_question",
         )},
+            # Explicit serving-mode stamp. Keep human_prompt_dirs above for old-server
+            # compatibility/provenance, but serving should never need to mount or scan it.
+            "human_prompt_enabled": bool(data_args.human_prompt_dirs),
             # Whether the expert attended the subtask turn in training. Attention-mask-only
             # (identical state_dict either way), so a mismatched serve loads cleanly and
             # degrades silently; the server reads this stamp and auto-applies it.

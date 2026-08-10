@@ -3,7 +3,12 @@
 # to /tmp/monitor_stall.log. Run in the background next to a training launch:
 #     bash scripts/monitor_stall.sh &
 # Kill it when done (kill %1 / its PID). Read together with the per-rank stack logs
-# /tmp/qwen_stall_rank*.log written by QWEN_STALL_DEBUG=1.
+# /tmp/qwen_stall_rank*.log written by QWEN_STALL_DEBUG=1. Stack dumps are on demand:
+# send SIGUSR1 to each direct torchrun child only after the samples show a real stall.
+# (Do not signal dataloader grandchildren.) Example:
+#   for p in $(pgrep -P "$(pgrep -n -f 'torchrun.*train_action_expert.py')"); do
+#       kill -USR1 "$p"
+#   done
 OUT=/tmp/monitor_stall.log
 echo "===== monitor start $(date) on $(hostname) =====" >> "$OUT"
 while true; do
