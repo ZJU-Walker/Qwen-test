@@ -80,9 +80,12 @@ GRAD_ACCUM=$((TARGET_BATCH / (PER_DEVICE_BATCH * NPROC_PER_NODE)))
 MODEL_PATH="Qwen/Qwen3-VL-4B-Instruct"
 OUTPUT_DIR="/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/qwen3_4b_ae_humanprompt_0717m0731_ee6d"
 CACHE_DIR="$CUSTOM_CACHE_DIR/huggingface"
-ROBOT_DATA_DIRS="/iris/projects/humanoid/trossen_data/0717_green_yellow_block_mem_merged,/iris/projects/humanoid/trossen_data/0731_green_yellow_merged"
-HUMAN_PROMPT_DIRS="green=/iris/projects/humanoid/trossen_data/green_human_prompt,yellow=/iris/projects/humanoid/trossen_data/yellow_human_prompt"
-FAST_TOKENIZER="/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/fast_tokenizer_trossen_0717m0731_ee6d_gated"
+# Modal can stage read-heavy videos on container-local SSD and override only these
+# inputs. Defaults preserve the exact cluster recipe and all durable outputs remain on
+# /iris. The copied trees are byte-identical, so changing paths does not change samples.
+ROBOT_DATA_DIRS="${ROBOT_DATA_DIRS:-/iris/projects/humanoid/trossen_data/0717_green_yellow_block_mem_merged,/iris/projects/humanoid/trossen_data/0731_green_yellow_merged}"
+HUMAN_PROMPT_DIRS="${HUMAN_PROMPT_DIRS:-green=/iris/projects/humanoid/trossen_data/green_human_prompt,yellow=/iris/projects/humanoid/trossen_data/yellow_human_prompt}"
+FAST_TOKENIZER="${FAST_TOKENIZER:-/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/fast_tokenizer_trossen_0717m0731_ee6d_gated}"
 RUN_NAME="qwen3vl_4b_ae_humanprompt_0717m0731_ee6d_bs64"
 
 # Training-time RTC prefix d ~ Uniform[0, max]; 10 matches the deployed delay of 8-10.
