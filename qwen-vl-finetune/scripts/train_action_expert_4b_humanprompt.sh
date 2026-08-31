@@ -31,7 +31,7 @@ cd "$(dirname "$0")/.." || exit
 #   * --max_steps 30000 is a CEILING: stop on plateau. Every checkpoint is servable.
 # ======================================================================================
 
-CUSTOM_CACHE_DIR="/iris/projects/humanoid/ke/Qwen3-VL/qwen_cache"
+CUSTOM_CACHE_DIR="${CUSTOM_CACHE_DIR:-/iris/projects/humanoid/ke/Qwen3-VL/qwen_cache}"
 mkdir -p "$CUSTOM_CACHE_DIR/huggingface" "$CUSTOM_CACHE_DIR/triton"
 export HF_HOME="$CUSTOM_CACHE_DIR/huggingface"
 export TRITON_CACHE_DIR="$CUSTOM_CACHE_DIR/triton"
@@ -65,20 +65,28 @@ MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
 # Pinned (not nvidia-smi): on a shared HGX node nvidia-smi ignores CUDA_VISIBLE_DEVICES
 # and would fan out to all 8 GPUs. Override: NPROC_PER_NODE=1 CUDA_VISIBLE_DEVICES=0 ...
 NPROC_PER_NODE=${NPROC_PER_NODE:-2}
+TORCHRUN=${TORCHRUN:-torchrun}
 
 # Effective batch is FIXED at 64 regardless of GPU count (accumulation derived).
 TARGET_BATCH=64
-# 2 (not the ee6d recipe's 4): the human-prompt clip is a second video, sequences are
-# ~1600 tokens vs ~1000, and 4-per-device OOMs an H200 by ~5 GB during backward.
-PER_DEVICE_BATCH=2
+# V1 default is 2: its prompt + robot-history two-video sequence OOMs an H200 at 4.
+# V2 overrides this after removing robot history; an H200 production one-step sweep found
+# batch 8 healthy and batch 16 OOM at 138.8/139.8 GiB.
+PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-2}"
 if [ $((TARGET_BATCH % (PER_DEVICE_BATCH * NPROC_PER_NODE))) -ne 0 ]; then
     echo "ERROR: TARGET_BATCH=$TARGET_BATCH not divisible by $PER_DEVICE_BATCH x $NPROC_PER_NODE GPUs" >&2
     exit 1
 fi
 GRAD_ACCUM=$((TARGET_BATCH / (PER_DEVICE_BATCH * NPROC_PER_NODE)))
 
-MODEL_PATH="Qwen/Qwen3-VL-4B-Instruct"
-OUTPUT_DIR="/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/qwen3_4b_ae_humanprompt_0717m0731_ee6d"
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-4B-Instruct}"
+# Keep dataset provenance in the artifact/run name. Variants may override DATA_TAG,
+# while the default remains byte-for-byte compatible with the original 0717+0731 run.
+DATA_TAG="${DATA_TAG:-0717m0731}"
+# Keep the historical project checkpoint location as the default, while allowing a
+# storage-constrained launch wrapper to redirect only its own durable artifacts.
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/iris/projects/humanoid/ke/Qwen3-VL/checkpoints}"
+OUTPUT_DIR="${CHECKPOINT_ROOT%/}/qwen3_4b_ae_humanprompt_${DATA_TAG}_ee6d"
 CACHE_DIR="$CUSTOM_CACHE_DIR/huggingface"
 # Modal can stage read-heavy videos on container-local SSD and override only these
 # inputs. Defaults preserve the exact cluster recipe and all durable outputs remain on
@@ -86,20 +94,57 @@ CACHE_DIR="$CUSTOM_CACHE_DIR/huggingface"
 ROBOT_DATA_DIRS="${ROBOT_DATA_DIRS:-/iris/projects/humanoid/trossen_data/0717_green_yellow_block_mem_merged,/iris/projects/humanoid/trossen_data/0731_green_yellow_merged}"
 HUMAN_PROMPT_DIRS="${HUMAN_PROMPT_DIRS:-green=/iris/projects/humanoid/trossen_data/green_human_prompt,yellow=/iris/projects/humanoid/trossen_data/yellow_human_prompt}"
 FAST_TOKENIZER="${FAST_TOKENIZER:-/iris/projects/humanoid/ke/Qwen3-VL/checkpoints/fast_tokenizer_trossen_0717m0731_ee6d_gated}"
-RUN_NAME="qwen3vl_4b_ae_humanprompt_0717m0731_ee6d_bs64"
+RUN_NAME="qwen3vl_4b_ae_humanprompt_${DATA_TAG}_ee6d_bs64"
+# Input-contract overrides used by isolated variants. Defaults preserve the original v1
+# recipe exactly. A sparse prompt variant must attach explicit Qwen3 timestamp metadata.
+STATE_HISTORY="${STATE_HISTORY:-True}"
+IMAGE_HISTORY="${IMAGE_HISTORY:-True}"
+CURRENT_STATE_MASK_PROB="${CURRENT_STATE_MASK_PROB:-0.0}"
+HUMAN_PROMPT_STRIDE="${HUMAN_PROMPT_STRIDE:-10}"
+HUMAN_PROMPT_MAX_FRAMES="${HUMAN_PROMPT_MAX_FRAMES:-12}"
+EXPLICIT_VIDEO_TIMESTAMPS="${EXPLICIT_VIDEO_TIMESTAMPS:-False}"
+# `${VAR-default}` (without the colon) intentionally permits an explicit empty value.
+# Clean pick/place recordings have no leading human-pointing phase, so their wrapper
+# sets this to empty; the original pointing datasets retain the `waiting` default.
+SKIP_LEADING_SUBTASK="${SKIP_LEADING_SUBTASK-waiting}"
+# Optional exact-root standalone pick stream (0827 ball): empty preserves every
+# historical recipe.  A wrapper that enables it must also use explicit-HL
+# (EXPERT_ATTENDS_SUBTASK=True); the trainer enforces that contract.
+UNPROMPTED_PICK_ONLY_DIRS="${UNPROMPTED_PICK_ONLY_DIRS-}"
+STANDALONE_ROBOT_QA_ENABLED="${STANDALONE_ROBOT_QA_ENABLED:-True}"
+ROBOT_QA_STRIDE="${ROBOT_QA_STRIDE:-10}"
+ROBOT_QA_MAX_FRAMES="${ROBOT_QA_MAX_FRAMES:-12}"
 
 # Training-time RTC prefix d ~ Uniform[0, max]; 10 matches the deployed delay of 8-10.
-RTC_MAX_DELAY=10
+# An expert-attends-subtask variant must raise this (bins uses 20; compressed ~5-token
+# answers decode in far fewer ticks than the cup task's ~17-20): serving decodes the
+# assistant answer serially before the expert runs. The value is stamped into
+# visual_budget.json as rtc_prefix_max_length and the server REJECTS any /infer whose
+# action_prefix exceeds it -- the client's DELAY_STEPS must stay <= this value.
+RTC_MAX_DELAY="${RTC_MAX_DELAY:-10}"
 if [ "$RTC_MAX_DELAY" -gt 0 ]; then
     OUTPUT_DIR="${OUTPUT_DIR}_rtc${RTC_MAX_DELAY}"
     RUN_NAME="${RUN_NAME}_rtc${RTC_MAX_DELAY}"
 fi
 
-EXPERT_ATTENDS_SUBTASK=False
+# False (default) = subtask insulation: the expert ignores the assistant answer turn and
+# serving never decodes it (VLM early-exits at L18). True = explicit-HL conditioning
+# (pi0.5 Fig-13): the expert ATTENDS the answer; serving decodes it per request via the
+# single-prefill generate_subtask_cached path and the full 36-layer VLM runs. Requires
+# fully-labeled data (the trainer refuses attends=True with unlabeled samples) and the
+# RTC_MAX_DELAY bump above. The server auto-applies the stamped mode.
+EXPERT_ATTENDS_SUBTASK="${EXPERT_ATTENDS_SUBTASK:-False}"
 if [ "$EXPERT_ATTENDS_SUBTASK" != "True" ]; then
     OUTPUT_DIR="${OUTPUT_DIR}_subinsul"
     RUN_NAME="${RUN_NAME}_subinsul"
+else
+    OUTPUT_DIR="${OUTPUT_DIR}_subattend"
+    RUN_NAME="${RUN_NAME}_subattend"
 fi
+
+# Per-sample subtask-text CE averaging (each question counts equally regardless of its
+# answer length). Turn on together with mixed-length QA formats.
+LM_LOSS_PER_SAMPLE="${LM_LOSS_PER_SAMPLE:-False}"
 
 EXPERT_VLM_LAYERS=18
 if [ "$EXPERT_VLM_LAYERS" -gt 0 ]; then
@@ -107,9 +152,9 @@ if [ "$EXPERT_VLM_LAYERS" -gt 0 ]; then
     RUN_NAME="${RUN_NAME}_L${EXPERT_VLM_LAYERS}"
 fi
 
-# Visual token budget (identical to the ee6d run; the prompt clip draws the same
-# per-video budget as the history video, so the sequence grows by roughly one video).
-VIDEO_MAX_PIXELS=1600000
+# Visual token budget. The default remains identical to the ee6d run; an isolated
+# prompt-density variant may override it and receives a distinct `_visN` artifact name.
+VIDEO_MAX_PIXELS="${VIDEO_MAX_PIXELS:-1600000}"
 WRIST_MAX_PIXELS=131072
 MAX_PIXELS=131072
 OUTPUT_DIR="${OUTPUT_DIR}_vis$((VIDEO_MAX_PIXELS / 100000))"
@@ -139,8 +184,12 @@ args=(
     # ---- robot data: gated 0717 merged + human demo pools ----
     --robot_data_dirs "$ROBOT_DATA_DIRS"
     --camera cam_high
-    --num_frames 10
-    --frame_stride 10
+    # History-video geometry (read only when IMAGE_HISTORY=True; V3 = 6 frames at
+    # stride 15 -> 2 frames/s over 2.5 s at the 30 fps datasets). Defaults match the
+    # pre-V3 hardcoded values.
+    --num_frames "${NUM_FRAMES:-10}"
+    --frame_stride "${FRAME_STRIDE:-10}"
+    --history_max_pixels "${HISTORY_MAX_PIXELS:-65536}"
     --active_dims "7:14"
     --action_space ee6d
     --action_dim 10
@@ -154,17 +203,44 @@ args=(
     --min_episode_len 50
     --image_aug True
     --image_aug_prob 1.0
-    --state_history True
+    --image_history "$IMAGE_HISTORY"
+    --state_history "$STATE_HISTORY"
+    --current_state_mask_prob "$CURRENT_STATE_MASK_PROB"
     # ---- the human-video-prompt setup ----
-    --skip_leading_subtask waiting
+    --skip_leading_subtask "$SKIP_LEADING_SUBTASK"
     # 440-sample "epochs" are ~7 optimizer steps; the dataloader pipeline restart at
     # every boundary starves the GPU. Virtual epochs make boundaries ~50x rarer.
     --dataset_epoch_multiplier 50
     --human_prompt_dirs "$HUMAN_PROMPT_DIRS"
-    --human_prompt_stride 10
-    --human_prompt_max_frames 12
-    --human_prompt_holdout 4
-    --subtask_question "which colored block did the human demonstrate picking up?"
+    --human_prompt_stride "$HUMAN_PROMPT_STRIDE"
+    --human_prompt_max_frames "$HUMAN_PROMPT_MAX_FRAMES"
+    --human_prompt_source_fps 30
+    --explicit_video_timestamps "$EXPLICIT_VIDEO_TIMESTAMPS"
+    --human_prompt_holdout "${HUMAN_PROMPT_HOLDOUT:-4}"
+    --subtask_question "${SUBTASK_QUESTION:-which colored block did the human demonstrate picking up?}"
+    # ---- segment-level prompts + bins QA (bins_task_plan.md; defaults preserve the
+    # original color-pool recipe byte-for-byte) ----
+    --human_prompt_segments "${HUMAN_PROMPT_SEGMENTS:-False}"
+    --human_prompt_full_episode_prob "${HUMAN_PROMPT_FULL_EP_PROB:-0.0}"
+    --subtask_format_mix "${SUBTASK_FORMAT_MIX-}"
+    # Which QA module the mix/answers/pool keys come from: "bins" (0817/0820 bins task)
+    # or "sort" (0824 three-tray sorting). Checkpoint-stamped; serving reads it back.
+    --subtask_task "${SUBTASK_TASK:-bins}"
+    # 'where' format only (sort): share of questions naming an object the drawn demo
+    # never showed, answered with the abstention "not shown".
+    --qa_where_absent_prob "${QA_WHERE_ABSENT_PROB:-0.2}"
+    # Hold out human demos per POOL KEY instead of per dataset (needed when a single
+    # human dataset holds every configuration, grouped on disk).
+    --human_prompt_holdout_per_key "${HUMAN_PROMPT_HOLDOUT_PER_KEY:-False}"
+    # Robot labels file (subtask_labels_4phase.json = pick/place split, 'phase' QA).
+    --robot_subtask_labels_file "${ROBOT_SUBTASK_LABELS_FILE:-subtask_labels.json}"
+    # Track-A order samples (language-only; requires 4-phase labels + a QA mix).
+    --order_sample_prob "${ORDER_SAMPLE_PROB:-0.0}"
+    # Exact opted-in one-segment pick roots yield paired action + robot-QA records.
+    --unprompted_pick_only_dirs "$UNPROMPTED_PICK_ONLY_DIRS"
+    --standalone_robot_qa_enabled "$STANDALONE_ROBOT_QA_ENABLED"
+    --robot_qa_stride "$ROBOT_QA_STRIDE"
+    --robot_qa_max_frames "$ROBOT_QA_MAX_FRAMES"
     # ---- knowledge insulation + FAST (gated ee6d artifact, carries norm_stats.json) ----
     --train_vlm True
     --predict_subtask True
@@ -179,6 +255,7 @@ args=(
     --rtc_prefix_max_length "$RTC_MAX_DELAY"
     # ---- subtask insulation ----
     --expert_attends_subtask "$EXPERT_ATTENDS_SUBTASK"
+    --lm_loss_per_sample "$LM_LOSS_PER_SAMPLE"
     # ---- SmolVLA layer skipping ----
     --expert_num_layers "$EXPERT_VLM_LAYERS"
     # ---- training: CONSTANT LR + EMA 0.999 ----
@@ -187,13 +264,15 @@ args=(
     --ema_decay "$EMA_DECAY"
     --lr_scheduler_type constant_with_warmup
     --warmup_steps 300
-    --max_steps 30000
+    # Overridable so a pre-launch dry run can execute the REAL recipe for a few steps
+    # (MAX_STEPS=3) instead of a hand-built approximation of it.
+    --max_steps "${MAX_STEPS:-30000}"
     --per_device_train_batch_size "$PER_DEVICE_BATCH"
     --gradient_accumulation_steps "$GRAD_ACCUM"
     --eval_strategy "no"
     --save_strategy "steps"
-    --save_steps 2000
-    --save_total_limit 3
+    --save_steps "${SAVE_STEPS:-2000}"
+    --save_total_limit "${SAVE_TOTAL_LIMIT:-3}"
     --save_safetensors False
     --learning_rate 1e-4
     --vlm_learning_rate 1e-5
@@ -203,6 +282,7 @@ args=(
     --ddp_timeout 7200
     --model_max_length 8192
     --gradient_checkpointing True
+    --torch_compile "${TORCH_COMPILE:-False}"
     --dataloader_num_workers "${NUM_WORKERS:-4}"
     --dataloader_prefetch_factor 4
     # persistent_workers requires num_workers > 0 (NUM_WORKERS=0 is the nan-debug mode:
@@ -216,7 +296,16 @@ args=(
     --report_to wandb
 )
 
-torchrun --nproc_per_node=$NPROC_PER_NODE \
+# A new input contract may warm-start model weights while deliberately resetting the
+# optimizer, scheduler, and step counter. Always forward this intent to Python: its
+# validated checkpoint selector decides whether to exact-resume instead. A shell glob
+# cannot distinguish a complete checkpoint from a directory left by a kill mid-save.
+INIT_FROM="${INIT_FROM-}"
+if [ -n "$INIT_FROM" ]; then
+    args+=(--init_from "$INIT_FROM")
+fi
+
+"$TORCHRUN" --nproc_per_node=$NPROC_PER_NODE \
          --master_addr=$MASTER_ADDR \
          --master_port=$MASTER_PORT \
          qwenvl/train/train_action_expert.py "${args[@]}"

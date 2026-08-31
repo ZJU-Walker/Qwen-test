@@ -9,7 +9,6 @@ import logging
 import math
 import multiprocessing
 import os
-import pathlib
 import signal
 import sys
 import tempfile
@@ -28,6 +27,7 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration, Trainer
 from qwenvl.action_expert import ActionExpertConfig, Qwen3VLWithActionExpert
 from qwenvl.data.robot_data import RobotDataArguments, make_robot_data_module
 from qwenvl.train.argument import TrainingArguments
+from qwenvl.train.expert_ema import ExpertEMACallback, select_latest_complete_checkpoint
 
 # QWEN_STALL_DEBUG=1: SIGUSR1 appends ALL thread stacks of this rank to
 # /tmp/qwen_stall_rank<R>.log (in-process faulthandler -- works where ptrace/py-spy is
@@ -90,6 +90,11 @@ class ActionExpertModelArguments:
     # Lets the server run the expert without waiting for subtask generation. Must match at
     # serve time (--insulated_subtask on the server). Only meaningful with predict_subtask.
     expert_attends_subtask: bool = field(default=True)
+    # Per-sample (mean-of-per-token-means) averaging for the subtask-text CE, so each
+    # question counts equally regardless of answer length. Matters once one batch mixes
+    # answer formats of very different lengths (e.g. a full task sentence vs a bin word);
+    # pooled per-token CE would weight a sample by its answer length.
+    lm_loss_per_sample: bool = field(default=False)
     # Warm-start: load model WEIGHTS from this checkpoint dir's pytorch_model.bin, but start
     # a FRESH optimizer/scheduler/step counter (unlike auto-resume, which restores all of
     # those and requires the same GPU count for ZeRO-2). Use this to continue a run under a
@@ -262,77 +267,31 @@ class EmbedNanWatchCallback(transformers.TrainerCallback):
         self._check(state, "after optimizer step")
 
 
-class ExpertEMACallback(transformers.TrainerCallback):
-    """EMA (exponential moving average) of the from-scratch parameters -- the expert
-    transformer + flow heads (everything not prefixed 'vlm.').
+class FirstStepCacheFlushCallback(transformers.TrainerCallback):
+    """One-shot cache release after the FIRST optimizer step of a (re)started run.
 
-    Every working flow/diffusion policy stack DEPLOYS an averaged copy of the weights,
-    not the raw optimizer iterate: openpi saves state.ema_params as the checkpoint
-    'params' the policy server loads (checkpoints.py:145-151, ema_decay=0.99 default);
-    Diffusion Policy evaluates its ema_model. The average sits near the center of the
-    orbit the weights trace around the loss minimum, so the served policy loses the
-    iterate noise that shows up as flickery action chunks (measured here as 5-10% of
-    motion range across noise seeds on a mid-training raw checkpoint).
+    Why (2026-08-20, iris-hgx-1): the trainer's very first logging gather
+    (_maybe_log_save_evaluate -> all_gather of tr_loss, logging_steps=1) is the
+    default process group's FIRST NCCL collective, and NCCL cudaMallocs its
+    communicator buffers OUTSIDE PyTorch's caching allocator -- at the exact moment
+    PyTorch's reserved pool sits at the resume peak. With another process holding
+    ~1 GiB (the allocation-keeper) three resume attempts OOMed deterministically at
+    step N+1 in that allgather, while the same code ran on an empty GPU. Releasing
+    the cache once, between the first optimizer step and the first gather
+    (on_step_end fires before _maybe_log_save_evaluate), hands the unused reserved
+    memory back to the driver so NCCL's raw allocation fits. One-time ~100 ms cost;
+    steady-state caching behavior is untouched afterwards."""
 
-    shadow = decay*shadow + (1-decay)*param after every optimizer step (decay 0.99 ~=
-    a 100-step average), fp32, on the params' device, RANK 0 ONLY (ZeRO-2 replicates
-    module params across ranks, so rank 0 sees the full weights). Saved as
-    `ema_expert.pt` inside each checkpoint dir; inference.load_model overlays it
-    automatically when present. The VLM group is excluded: at lr 1e-5 it barely moves,
-    and its shadow would cost ~16 GB vs ~3 GB for the expert."""
+    def __init__(self):
+        self._done = False
 
-    def __init__(self, model, decay: float = 0.99):
-        self.decay = decay
-        self.model = model
-        self._is_rank0 = int(os.environ.get("RANK", 0)) == 0
-        self._tracked = None
-        self.shadow = None  # deferred: see _ensure_shadow
-
-    @torch.no_grad()
-    def _ensure_shadow(self):
-        """Snapshot the shadow AFTER the Trainer/DeepSpeed has moved the model to its
-        device. At callback-construction time the model is still on CPU (train() does the
-        move), so an eager snapshot leaves a CPU shadow fighting CUDA params -- the exact
-        crash this replaces. Param objects keep their identity through .to()/DS wrapping,
-        so snapshotting lazily gets device-correct tensors from the same references."""
-        self._tracked = [(n, p) for n, p in self.model.named_parameters()
-                         if p.requires_grad and not n.startswith("vlm.")]
-        self.shadow = {n: p.detach().float().clone() for n, p in self._tracked}
-        n_params = sum(v.numel() for v in self.shadow.values())
-        dev = next(iter(self.shadow.values())).device
-        rank0_print(f"[ema] tracking {len(self.shadow)} tensors ({n_params/1e6:.0f}M params) "
-                    f"on {dev}, decay={self.decay} (~{1/(1-self.decay):.0f}-step average), "
-                    f"fp32 shadow {n_params*4/1e9:.1f} GB")
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        # Model is on-device and (if --init_from) warm-started by now: shadow = step-0 weights.
-        if self._is_rank0 and self.shadow is None:
-            self._ensure_shadow()
-
-    @torch.no_grad()
     def on_step_end(self, args, state, control, **kwargs):
-        if not self._is_rank0:
-            return
-        if self.shadow is None:  # backstop if on_train_begin was skipped
-            self._ensure_shadow()
-        d = self.decay
-        for n, p in self._tracked:
-            buf = self.shadow[n]
-            if buf.device != p.device:  # e.g. model moved after snapshot; realign once
-                buf = self.shadow[n] = buf.to(p.device)
-            buf.mul_(d).add_(p.detach().float(), alpha=1.0 - d)
+        if not self._done:
+            self._done = True
+            import gc
 
-    def on_save(self, args, state, control, **kwargs):
-        if not self._is_rank0 or self.shadow is None:
-            return
-        ckpt = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
-        if os.path.isdir(ckpt):
-            torch.save(
-                {"decay": self.decay, "step": state.global_step,
-                 "params": {k: v.cpu() for k, v in self.shadow.items()}},
-                os.path.join(ckpt, "ema_expert.pt"),
-            )
-            rank0_print(f"[ema] saved ema_expert.pt @ step {state.global_step}")
+            gc.collect()
+            torch.cuda.empty_cache()
 
 
 def set_vlm_trainable(model_args, vlm):
@@ -383,6 +342,31 @@ def train(attn_implementation="flash_attention_2"):
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     os.makedirs(training_args.output_dir, exist_ok=True)
+    if not 0.0 <= model_args.ema_decay < 1.0:
+        raise ValueError(f"--ema_decay must be in [0, 1), got {model_args.ema_decay}")
+    if (not math.isfinite(data_args.current_state_mask_prob)
+            or not 0.0 <= data_args.current_state_mask_prob <= 1.0):
+        raise ValueError(
+            "--current_state_mask_prob must be finite and in [0, 1], got "
+            f"{data_args.current_state_mask_prob}"
+        )
+    if data_args.current_state_mask_prob > 0.0 and data_args.state_history:
+        raise ValueError(
+            "--current_state_mask_prob > 0 requires --state_history False; "
+            "otherwise Past states would defeat the intended proprioception mask"
+        )
+
+    # Resolve an explicit, validated resume target before loading the model or touching
+    # warm-start weights. Transformers' implicit True path picks the numerically highest
+    # directory even when a preemption interrupted its multi-file save. A torn newest
+    # checkpoint is skipped only when an older exact-resume checkpoint is complete; if
+    # none is complete, fail closed instead of silently starting over.
+    resume_checkpoint = select_latest_complete_checkpoint(
+        training_args.output_dir,
+        expected_ema_decay=(model_args.ema_decay if model_args.ema_decay > 0 else None),
+        expected_world_size=int(os.environ.get("WORLD_SIZE", training_args.world_size)),
+        require_deepspeed=bool(training_args.deepspeed),
+    )
 
     # Record the visual budget alongside the checkpoint. Serving MUST feed the model the same
     # resolution it trained on -- these budgets are not recoverable from the weights, and a
@@ -392,6 +376,9 @@ def train(attn_implementation="flash_attention_2"):
         atomic_json_dump({**{k: getattr(data_args, k) for k in (
             "video_max_pixels", "video_min_pixels", "max_pixels", "min_pixels",
             "wrist_max_pixels", "num_frames", "frame_stride", "image_history",
+            # V3 history-video input contract: per-frame GATE-1 pre-resize budget for the
+            # cam_high history clip. Meaningless (and unread) when image_history=false.
+            "history_max_pixels",
             # Which wrist cameras the model conditions on -- serving a 2-wrist checkpoint
             # with 1 wrist (or vice versa) would degrade silently otherwise. The serve-side
             # budget overlay (inference.build_data_args) applies this automatically; old
@@ -400,10 +387,40 @@ def train(attn_implementation="flash_attention_2"):
             # Whether the prompt carries the frame-aligned past states ("Past states:") --
             # an input-shape contract like the above: serving must build the same prompt.
             "state_history",
+            # Training-time current-state dropout provenance. The raw state still defines
+            # delta-action targets; masked samples render the literal State: [MASKED].
+            "current_state_mask_prob",
             # Human-video-prompt conditioning: serving must prepend the demo clip with
             # the same structure and sampling (dirs non-empty <=> mode on; the dirs
             # themselves are irrelevant at serve time -- the demo arrives per request).
             "human_prompt_dirs", "human_prompt_stride", "human_prompt_max_frames",
+            "human_prompt_source_fps",
+            "explicit_video_timestamps",
+            # Segment-level prompts + bins QA (bins_task_plan.md). Serving needs
+            # human_prompt_segments only as provenance (uploads are already sub-clips
+            # or full clips; the sampling rule above applies unchanged); the mix and
+            # full-episode prob are training-time provenance.
+            "human_prompt_segments", "human_prompt_full_episode_prob",
+            "subtask_format_mix",
+            # Which QA module the mix, the answers and the human-pool keys came from
+            # ("bins" / "sort"). Serving must decode with the same module: the answer
+            # vocabularies and the pool keys differ per task. Old checkpoints without
+            # the key keep the "bins" default.
+            "subtask_task",
+            # Training-time provenance for the sorting task's 'where' format.
+            "qa_where_absent_prob", "human_prompt_holdout_per_key",
+            # Which robot labels file the run trained on (subtask_labels_4phase.json =
+            # pick/place split). The serve-side overlay applies it so the server scans
+            # the same labels; old checkpoints without the key keep the default.
+            "robot_subtask_labels_file",
+            # Training-time provenance only (Track-A language-only order samples).
+            "order_sample_prob",
+            # Training-time provenance for exact-root standalone pick skill records.
+            # Serving does not rescan these roots; inference.build_data_args clears the
+            # path allowlist while retaining the robot-QA sampling contract in the
+            # checkpoint metadata for reproducibility.
+            "unprompted_pick_only_dirs", "standalone_robot_qa_enabled",
+            "robot_qa_stride", "robot_qa_max_frames",
             # Exact text is part of the token-level input contract. The first
             # human-prompt checkpoint predates this key (serving has a compatibility
             # fallback), but all new checkpoints must carry it explicitly.
@@ -416,6 +433,12 @@ def train(attn_implementation="flash_attention_2"):
             # (identical state_dict either way), so a mismatched serve loads cleanly and
             # degrades silently; the server reads this stamp and auto-applies it.
             "expert_attends_subtask": model_args.expert_attends_subtask,
+            # Provenance only (training-time loss averaging; nothing at serve reads it).
+            "lm_loss_per_sample": model_args.lm_loss_per_sample,
+            # Max frozen-prefix length RTC training clamped to: operators must keep the
+            # serve-time DELAY_STEPS at or below this (the expert never trained on longer
+            # prefixes; exceeding it degrades silently).
+            "rtc_prefix_max_length": model_args.rtc_prefix_max_length,
         }, os.path.join(training_args.output_dir, "visual_budget.json"))
 
     if "qwen3" not in model_args.model_name_or_path.lower():
@@ -434,6 +457,13 @@ def train(attn_implementation="flash_attention_2"):
             "--use_fast_tokens. Otherwise the flow-matching loss is insulated from the VLM "
             "(by design), so its trainable params get no gradient — wasting memory and "
             "potentially hanging DeepSpeed. Or set --train_vlm False."
+        )
+    if (getattr(data_args, "unprompted_pick_only_dirs", "").strip()
+            and not model_args.expert_attends_subtask):
+        raise ValueError(
+            "--unprompted_pick_only_dirs requires --expert_attends_subtask True "
+            "because standalone action records place the oracle 'pick <object>' in "
+            "the assistant turn."
         )
 
     vlm = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -472,6 +502,7 @@ def train(attn_implementation="flash_attention_2"):
         rtc_prefix_min_length=model_args.rtc_prefix_min_length,
         rtc_prefix_max_length=model_args.rtc_prefix_max_length,
         expert_attends_subtask=model_args.expert_attends_subtask,
+        lm_loss_per_sample=model_args.lm_loss_per_sample,
     )
     if training_args.bf16:
         # Expert transformer in bf16 like the VLM; flow-matching heads (action/time
@@ -563,8 +594,10 @@ def train(attn_implementation="flash_attention_2"):
     # Warm-start weights (fresh optimizer/scheduler). Runs on every rank BEFORE DeepSpeed
     # wraps the model; ZeRO-2 replicates params so each rank needs the full state dict. The
     # embeddings were already resized above, so shapes match the FAST checkpoint.
-    if model_args.init_from:
+    if model_args.init_from and resume_checkpoint is None:
         ckpt_bin = os.path.join(model_args.init_from, "pytorch_model.bin")
+        if not os.path.isfile(ckpt_bin):
+            raise FileNotFoundError(f"--init_from lacks pytorch_model.bin: {ckpt_bin}")
         rank0_print(f"Warm-starting weights from {ckpt_bin} (fresh optimizer/scheduler)")
         state_dict = torch.load(ckpt_bin, map_location="cpu", mmap=True, weights_only=True)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -574,6 +607,10 @@ def train(attn_implementation="flash_attention_2"):
                 f"  load_state_dict: {len(missing)} missing, {len(unexpected)} unexpected "
                 f"(missing[:3]={missing[:3]}, unexpected[:3]={unexpected[:3]})"
             )
+    elif model_args.init_from:
+        rank0_print(
+            f"Exact-resuming {resume_checkpoint}; ignoring --init_from {model_args.init_from}"
+        )
 
     trainer = ActionExpertTrainer(
         model=model,
@@ -583,14 +620,22 @@ def train(attn_implementation="flash_attention_2"):
         **data_module,
     )
     if model_args.ema_decay > 0:
-        # After init_from so the shadow starts from the warm-started weights.
-        trainer.add_callback(ExpertEMACallback(model, decay=model_args.ema_decay))
+        # Fresh/weights-only runs snapshot at train begin. Exact resumes load the
+        # checkpoint EMA at that same hook, after Trainer/DeepSpeed and TrainerState.
+        trainer.add_callback(
+            ExpertEMACallback(
+                model,
+                decay=model_args.ema_decay,
+                resume_checkpoint=resume_checkpoint,
+            )
+        )
+    trainer.add_callback(FirstStepCacheFlushCallback())
     if os.environ.get("QWEN_NAN_DEBUG"):
         trainer.add_callback(EmbedNanWatchCallback(model))
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        logging.info("checkpoint found, resume training")
-        trainer.train(resume_from_checkpoint=True)
+    if resume_checkpoint is not None:
+        logging.info("resuming exact checkpoint %s", resume_checkpoint)
+        trainer.train(resume_from_checkpoint=str(resume_checkpoint))
     else:
         trainer.train()
     trainer.save_state()

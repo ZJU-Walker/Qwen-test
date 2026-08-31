@@ -16,13 +16,15 @@ pixel_values_videos, video_grid_thw) plus the normalized action chunk.
 """
 
 import json
+import math
 import os
 import random
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 import numpy as np
 import pandas as pd
@@ -63,6 +65,17 @@ class RobotDataArguments(DataArguments):
     # pre-loaded PIL images (a raw 540x960 wrist frame would otherwise become ~420 tokens,
     # 9x a video frame). ~50176 -> ~45-64 tokens, comparable to one cam_high frame.
     wrist_max_pixels: int = 50176
+    # Pixel budget for EACH cam_high history frame (image_history=True only), applied as a
+    # GATE-1 pre-resize before the video processor -- same reason as the wrist stills, but
+    # for the video path the processor budget (--video_max_pixels) is a T*H*W VOLUME shared
+    # by the whole clip (qwen3_vl video smart_resize), so raw 6x540x960 history frames
+    # (3.1M px) would be sized like the prompt video (~250 tokens/frame-pair). At 65536
+    # px/frame the history grid is (3,12,22) = 66 tokens/pair: history carries motion/
+    # progress; current-frame detail lives in the wrists + state. The 200704
+    # video_min_pixels floor is also a volume (6x65536 = 393k px > floor), so nothing gets
+    # upscaled back. Input-shape contract: stamped into visual_budget.json; serve must
+    # pre-resize identically.
+    history_max_pixels: int = 65536
     action_dim: int = 14
     action_horizon: int = 50
     # Which raw state/action dimensions to use (always the same for both). Python
@@ -106,6 +119,12 @@ class RobotDataArguments(DataArguments):
     # like the frames (indices max(0, t - k*stride) -- near the episode start the first
     # state repeats). Input-shape contract: stamped into visual_budget.json; serve must match.
     state_history: bool = False
+    # Per-sample dropout of the CURRENT model-visible robot state.  The raw/current
+    # state is still used for EE conversion, action-delta targets and normalization;
+    # only the prompt renders ``State: [MASKED]``.  This is deliberately separate
+    # from ``state_history`` (past states) and defaults to zero so every historical
+    # recipe preserves its exact RNG stream and input contract.
+    current_state_mask_prob: float = 0.0
     # If True (knowledge-insulation co-training), the user turn asks a fixed question and
     # the assistant turn contains the time-aligned subtask label with LM supervision.
     # If False (default, pi0.5-style), the subtask label IS the prompt and there is no
@@ -127,22 +146,107 @@ class RobotDataArguments(DataArguments):
     # videos for the tasks whose subtask label CONTAINS the key, e.g.
     #   "green=/data/green_human_prompt,yellow=/data/yellow_human_prompt".
     # When set, every sample prepends a randomly drawn same-task human demo clip as a
-    # SECOND video ("Human demonstration:" ... "Robot view:" ...): fresh pairing on every
-    # draw, so the model cannot memorize demo<->episode associations and must read the
-    # demo's content. Combine with skip_leading_subtask when the robot episodes contain
-    # an in-scene instruction phase (e.g. pointing) that would leak the task.
+    # first visual segment ("Human demonstration:" ... "Robot view:" ...): fresh pairing
+    # on every draw, so the model cannot memorize demo<->episode associations and must read
+    # the demo's content. It is a second video when robot image_history=True; otherwise the
+    # robot views are still images and it is the only video. Combine with
+    # skip_leading_subtask when the robot episodes contain an in-scene instruction phase
+    # (e.g. pointing) that would leak the task.
     human_prompt_dirs: str = ""
-    # Prompt-clip sampling: every `human_prompt_stride`th frame -- keep it equal to
-    # frame_stride so both videos share the M-RoPE seconds-per-frame truthfully -- with
-    # the final frame (the grasp outcome) always included, uniformly re-spaced down to
+    # Prompt-clip sampling: every `human_prompt_stride`th source frame, with the final
+    # frame (the grasp outcome) always included, uniformly re-spaced down to
     # `human_prompt_max_frames` when over. Input-shape contract: stamped into
     # visual_budget.json; serve-time prompt sampling must match.
     human_prompt_stride: int = 10
     human_prompt_max_frames: int = 12
+    # Frame-index timestamps use this source rate. The client records/resamples raw
+    # uploads to the same contract before /set_prompt. All current prompt-pool clips are
+    # independently ffprobe-verified CFR 30 fps.
+    human_prompt_source_fps: float = 30.0
+    # Qwen3-VL inserts textual <x.y seconds> markers for video temporal patches. A list
+    # of pre-sampled PIL frames otherwise silently defaults to consecutive frames at
+    # 24 fps. New sparse-prompt variants must enable this to attach the original 30-fps
+    # source indices. Checkpoint-stamped; serving must supply matching metadata.
+    explicit_video_timestamps: bool = False
     # Reserve the LAST N videos (sorted order) of each pool for evaluation: never drawn
     # during training, so the prompt-swap success test measures reading an UNSEEN demo,
     # not recognizing a memorized one.
     human_prompt_holdout: int = 4
+    # ---- segment-level prompts (0817 bins task, bins_task_plan.md) ----
+    # True: human_prompt_dirs is a comma-separated list of BARE dataset paths (no
+    # 'key='). Pools are keyed by the EXACT segment task strings of each human
+    # dataset's subtask_labels.json, and every sample draws a SUB-CLIP whose task
+    # equals the robot segment at the sampled timestep t (fresh draw per sample).
+    # Task strings must match verbatim between robot and human labels.
+    human_prompt_segments: bool = False
+    # With probability p a segment-mode sample uses the FULL human episode (both
+    # placements) as the prompt instead of the matching sub-clip; the supervised
+    # answer stays the segment at t. Teaches "given the whole plan + the current
+    # scene, what now?" so one full prompt can run both placements autonomously
+    # under attends serving. Pools keyed by the episode's ordered task-string pair.
+    human_prompt_full_episode_prob: float = 0.0
+    # Bins-task QA supervision (qwenvl/data/subtask_formats_bins.py), e.g.
+    # "current:0.6,block:0.2,bin:0.2". Per sample: one format + a random training
+    # phrasing; the answer derives from the segment task at t (compressed, e.g.
+    # "yellow to green bin"). Empty = legacy behavior (--subtask_question + the raw
+    # segment task string as the answer). Requires human_prompt_segments.
+    subtask_format_mix: str = ""
+    # Which QA module the mix, the answers and the human-pool keys come from:
+    # "bins" = qwenvl/data/subtask_formats_bins.py (0817/0820 bins task),
+    # "sort" = qwenvl/data/subtask_formats_sort.py (0824 three-tray sorting task).
+    # Checkpoint-stamped: serving must decode with the module it was trained on.
+    subtask_task: str = "bins"
+    # 'where' format only (sorting task): probability that the queried object is one the
+    # DRAWN demo never handled, so the answer is the abstention "not shown". 0 disables
+    # abstention supervision entirely (every 'where' question then names an object the
+    # demo showed).
+    qa_where_absent_prob: float = 0.2
+    # Exact robot dataset roots that contain a ONE-SEGMENT pick-only skill for which
+    # there is intentionally no human prompt.  This is opt-in by full root path: the
+    # loader validates every selected episode with the task module's
+    # ``is_standalone_pick`` predicate, then exposes an action record and, by default,
+    # a second robot-QA record per episode:
+    #
+    #   * action: ordinary question in the user prompt plus oracle ``pick <object>``
+    #     as an assistant turn (the inference-time structure), flow + FAST enabled,
+    #     but no subtask-text CE;
+    #   * robot_qa: either an initial-view or whole-episode robot-demonstration QA,
+    #     subtask-text CE enabled, flow + FAST disabled.
+    #
+    # All other roots retain the ordinary human-prompt-conditioned behavior.  Keeping
+    # this an exact-root allowlist prevents a malformed ordinary episode from silently
+    # bypassing prompt-pool validation merely because it happens to have one segment.
+    unprompted_pick_only_dirs: str = ""
+    # Ablation switch for the SECOND record above. False keeps every standalone action
+    # record but omits its robot-QA twin. Default True preserves the original 0827-ball
+    # recipe and all existing launch behavior.
+    standalone_robot_qa_enabled: bool = True
+    # Sparse sampling contract for the whole-episode robot video used by the QA record.
+    # The final frame is always included, matching human-prompt video sampling.
+    robot_qa_stride: int = 10
+    robot_qa_max_frames: int = 12
+    # human_prompt_holdout counts per DATASET by default (the last N episodes of each
+    # human dataset, sorted). True holds out the last N per POOL KEY instead. With a
+    # single human dataset whose episodes are grouped by configuration on disk, a
+    # dataset-tail holdout removes N episodes of ONE configuration and leaves every
+    # other configuration with no unseen demo; per-key gives each one a held-out demo.
+    human_prompt_holdout_per_key: bool = False
+    # Which labels file to read from each ROBOT dataset's videos/chunk-*/ (human
+    # prompt datasets always use subtask_labels.json). "subtask_labels_4phase.json"
+    # selects the pick/place-split labels (gen_0817_subtask_labels.py
+    # --derive-4phase); use the "phase" QA format with them. Checkpoint-stamped so
+    # the server scans the same labels.
+    robot_subtask_labels_file: str = "subtask_labels.json"
+    # Track-A order samples (bins_task_plan.md, 2026-08-20): with this probability a
+    # sample becomes LANGUAGE-ONLY order supervision -- prompt = a human sub-clip of
+    # the SECOND placement (pick-yellow pair), observation = a timestep inside the
+    # FIRST pick segment (both blocks still on the table), answer = the second
+    # placement's phase ("pick yellow"). The robot's real actions at that timestep
+    # belong to the other conditioning, so the flow loss is masked per sample
+    # (action_loss_mask) and the FAST labels are set to IGNORE; only the subtask CE
+    # supervises. This makes the prompt the ONLY signal separating two identical
+    # scenes, forcing prompt-conditioned order. Requires 4-phase labels + a QA mix.
+    order_sample_prob: float = 0.0
     # Virtual epoch length: __len__ reports num_episodes * this. Every item is an
     # independent (episode, random timestep, random prompt, random aug) draw, so "epoch"
     # has no statistical meaning -- but the dataloader restarts its prefetch pipeline at
@@ -157,6 +261,137 @@ class RobotDataArguments(DataArguments):
     # continuous action expert is masked OUT of these positions (anti-shortcut).
     use_fast_tokens: bool = False
     fast_tokenizer_path: Optional[str] = None
+
+
+# Sentinel: a PROMPT-RELATIVE QA answer, which cannot be built until the human prompt
+# clip is drawn ('demo' describes the drawn clip; 'where' asks about one object in it
+# and rewrites its own question once the clip is known; 'remaining' lists the drawn
+# clip's placements that are still outstanding). Replaced in _build_item right after
+# _extract_human_prompt records self._last_prompt_keys.
+_PROMPT_ANSWER_PENDING = object()
+# Formats whose prompt must be the FULL human episode: 'remaining' asks what is left of
+# the demonstrated plan, which a one-placement sub-clip cannot convey.
+_FORCE_FULL_PROMPT_FORMATS = ("remaining",)
+
+
+_TRAIN_EXCLUDE_FILE = "train_exclude_episodes.json"
+_EPISODE_BASENAME_RE = re.compile(r"^episode_[0-9]{6}\.mp4$")
+
+
+def load_train_exclude_episodes(
+    root: Path, known_episode_names: Optional[Iterable[str]] = None,
+) -> Set[str]:
+    """Read and strictly validate ``meta/train_exclude_episodes.json``.
+
+    The sidecar is intentionally dataset-local and basename-based so the exact same
+    selection can be applied by robot training, human-prompt pooling, and FAST fitting::
+
+        {"version": 1, "reason": "...", "episodes": ["episode_000005.mp4"]}
+
+    When ``known_episode_names`` is supplied, every exclusion must name an episode that
+    exists in the caller's source of truth (parquets for robot/FAST scans, labels for a
+    human-prompt scan).  Stale typos therefore fail before any training data are read.
+    """
+    root = Path(root)
+    path = root / "meta" / _TRAIN_EXCLUDE_FILE
+    if not path.exists():
+        return set()
+    try:
+        with path.open() as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read train-exclusion sidecar {path}: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must contain a JSON object, got {type(payload).__name__}")
+    required = {"version", "reason", "episodes"}
+    missing = sorted(required - set(payload))
+    extra = sorted(set(payload) - required)
+    if missing or extra:
+        raise ValueError(
+            f"{path} must have exactly {sorted(required)}; missing={missing}, extra={extra}"
+        )
+    version = payload["version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        raise ValueError(f"{path} version must be integer 1, got {version!r}")
+    reason = payload["reason"]
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(f"{path} reason must be a non-empty string")
+    episode_list = payload["episodes"]
+    if not isinstance(episode_list, list):
+        raise ValueError(f"{path} episodes must be a JSON list")
+
+    malformed = [
+        value for value in episode_list
+        if not isinstance(value, str) or _EPISODE_BASENAME_RE.fullmatch(value) is None
+    ]
+    if malformed:
+        raise ValueError(
+            f"{path} has malformed episode basename(s) {malformed}; expected "
+            "'episode_XXXXXX.mp4'"
+        )
+    if len(set(episode_list)) != len(episode_list):
+        duplicates = sorted({name for name in episode_list if episode_list.count(name) > 1})
+        raise ValueError(f"{path} lists duplicate episode basename(s): {duplicates}")
+
+    excluded = set(episode_list)
+    if known_episode_names is not None:
+        known = set(known_episode_names)
+        unknown = sorted(excluded - known)
+        if unknown:
+            raise ValueError(
+                f"{path} names episode(s) not present in {root}: {unknown}"
+            )
+    return excluded
+
+
+def _parse_exact_root_allowlist(spec: str, robot_data_dirs: str) -> Set[str]:
+    """Canonicalize and validate an exact dataset-root allowlist.
+
+    The allowlist must be a subset of ``robot_data_dirs``.  In particular, accepting a
+    parent directory or a basename match would make it too easy to accidentally exempt
+    an ordinary prompted dataset from prompt validation.
+    """
+    requested_raw = [part.strip() for part in (spec or "").split(",") if part.strip()]
+    if not requested_raw:
+        return set()
+    declared_raw = [
+        part.strip() for part in (robot_data_dirs or "").split(",") if part.strip()
+    ]
+    requested = [str(Path(part).resolve()) for part in requested_raw]
+    declared = {str(Path(part).resolve()) for part in declared_raw}
+    if len(set(requested)) != len(requested):
+        raise ValueError(
+            "--unprompted_pick_only_dirs contains the same canonical root more than once"
+        )
+    missing = sorted(path for path in requested if not Path(path).is_dir())
+    if missing:
+        raise ValueError(
+            f"--unprompted_pick_only_dirs contains missing dataset root(s): {missing}"
+        )
+    undeclared = sorted(set(requested) - declared)
+    if undeclared:
+        raise ValueError(
+            "--unprompted_pick_only_dirs must be an exact subset of --robot_data_dirs; "
+            f"not present there: {undeclared}"
+        )
+    return set(requested)
+
+
+def subtask_formats_module(name: str):
+    """The per-task QA module selected by --subtask_task.
+
+    Resolved by NAME on every access rather than held on the dataset: with
+    dataloader workers the dataset is pickled, and a module object is not picklable
+    ("TypeError: cannot pickle 'module' object" at the first epoch). The import is a
+    sys.modules hit after the first call, so this is free."""
+    if name == "bins":
+        from qwenvl.data import subtask_formats_bins as module
+    elif name == "sort":
+        from qwenvl.data import subtask_formats_sort as module
+    else:
+        raise ValueError(f"unknown --subtask_task {name!r} (have 'bins', 'sort')")
+    return module
 
 
 def parse_active_dims(spec: Optional[str]) -> Optional[np.ndarray]:
@@ -212,8 +447,26 @@ def _discretize_state(normalized_state: np.ndarray, fixed_width: bool = False) -
     return " ".join(map(str, discretized))
 
 
+def _seek_seconds(frame: int, fps: float) -> float:
+    """start_pts (seconds) for a windowed read_video that must BEGIN at `frame`.
+
+    torchvision floors start_pts into the stream timebase and, when the result is not
+    exactly a frame's pts, PREPENDS the last frame before it (torchvision/io/video.py).
+    `frame / fps` is not binary-exact -- e.g. 123 / 30.0 * 15360 = 62975.99999... floors
+    to 62975, one tick below frame 123's pts of 62976 -- so the window silently starts
+    one frame EARLY and every index derived from it is stale by 33 ms. That hit ~1% of
+    timesteps (t = 123, 245, 246, 247, 490, ... at 30 fps) with no error and no log line,
+    and it is a train/serve mismatch: serving feeds frames aligned to the state.
+
+    Aiming half a frame PAST the target floors to a tick strictly inside [frame,
+    frame+1), so the prepended frame is exactly `frame`. Verified frame-exact over every
+    timestep of 0824 and 0817 videos on all three cameras (previously 33 mismatches)."""
+    return (frame + 0.5) / fps
+
+
 def format_robot_prompt(task: str, normalized_state: np.ndarray,
-                        past_states: Optional[np.ndarray] = None) -> str:
+                        past_states: Optional[np.ndarray] = None,
+                        mask_current_state: bool = False) -> str:
     """pi0.5-style prompt with the discretized state. Must be identical at train/serve time.
 
     `past_states` (K, D), oldest first: the states at the SAME clamped timesteps as the
@@ -221,13 +474,17 @@ def format_robot_prompt(task: str, normalized_state: np.ndarray,
     before the current state so `State:` keeps its trained position next to the action
     region; each past state is discretized exactly like the current one, ';'-separated."""
     cleaned = task.strip().replace("_", " ").replace("\n", " ")
+    current = (
+        "[MASKED]"
+        if mask_current_state
+        else _discretize_state(normalized_state, fixed_width=past_states is not None)
+    )
     if past_states is not None and len(past_states) > 0:
         # State-history format is fixed-width throughout (see _discretize_state): the
         # prompt token count is then CONSTANT, so compiled serving warms one shape.
         past_str = " ; ".join(_discretize_state(s, fixed_width=True) for s in past_states)
-        return (f"Task: {cleaned}, Past states: {past_str}, "
-                f"State: {_discretize_state(normalized_state, fixed_width=True)}")
-    return f"Task: {cleaned}, State: {_discretize_state(normalized_state)}"
+        return f"Task: {cleaned}, Past states: {past_str}, State: {current}"
+    return f"Task: {cleaned}, State: {current}"
 
 
 def make_action_chunk(
@@ -302,6 +559,19 @@ def compute_norm_stats(
     return {"state": _stats(states), "actions": _stats(action_values)}
 
 
+def _episodes_for_norm_stats(episodes: Sequence[Dict]) -> List[Dict]:
+    """One physical/action-bearing record per episode for normalization.
+
+    Robot-QA is a language-only duplicate of its standalone-action record.  Excluding
+    it here makes normalization identical whether robot-QA is enabled or ablated and
+    matches FAST fitting, which scans each parquet once.
+    """
+    return [
+        episode for episode in episodes
+        if episode.get("sample_mode") != "standalone_robot_qa"
+    ]
+
+
 class RobotFlowMatchingDataset(Dataset):
     def __init__(self, processor, data_args: RobotDataArguments):
         super().__init__()
@@ -309,6 +579,58 @@ class RobotFlowMatchingDataset(Dataset):
             raise ValueError("RobotFlowMatchingDataset only supports Qwen3-VL")
         self.get_rope_index = get_rope_index_3
         self.data_args = data_args
+        # Validated here so a bad name fails at startup; the module itself is resolved
+        # per access by the _fmt property (the dataset is pickled to dataloader workers
+        # and a module attribute would break that).
+        self._subtask_task = getattr(data_args, "subtask_task", "bins") or "bins"
+        subtask_formats_module(self._subtask_task)
+        self._unprompted_pick_only_roots = _parse_exact_root_allowlist(
+            getattr(data_args, "unprompted_pick_only_dirs", ""),
+            data_args.robot_data_dirs,
+        )
+        self._standalone_robot_qa_enabled = bool(
+            getattr(data_args, "standalone_robot_qa_enabled", True)
+        )
+        self._current_state_mask_prob = float(
+            getattr(data_args, "current_state_mask_prob", 0.0)
+        )
+        if (not np.isfinite(self._current_state_mask_prob)
+                or not 0.0 <= self._current_state_mask_prob <= 1.0):
+            raise ValueError(
+                "--current_state_mask_prob must be finite and in [0, 1], got "
+                f"{self._current_state_mask_prob}"
+            )
+        if self._current_state_mask_prob > 0.0 and data_args.state_history:
+            raise ValueError(
+                "--current_state_mask_prob > 0 requires --state_history False; "
+                "otherwise Past states would defeat the intended proprioception mask"
+            )
+        if self._unprompted_pick_only_roots:
+            if self._subtask_task != "sort":
+                raise ValueError(
+                    "--unprompted_pick_only_dirs currently requires --subtask_task sort"
+                )
+            if not data_args.predict_subtask:
+                raise ValueError(
+                    "--unprompted_pick_only_dirs requires --predict_subtask True: its "
+                    "oracle action turn must match generated-subtask inference"
+                )
+            if not data_args.use_fast_tokens:
+                raise ValueError(
+                    "--unprompted_pick_only_dirs requires --use_fast_tokens True: its "
+                    "action records are defined to train both FAST and flow"
+                )
+            if (self._standalone_robot_qa_enabled
+                    and int(getattr(data_args, "robot_qa_stride", 0)) <= 0):
+                raise ValueError(
+                    f"robot_qa_stride must be positive, got {data_args.robot_qa_stride}"
+                )
+            if (self._standalone_robot_qa_enabled
+                    and int(getattr(data_args, "robot_qa_max_frames", 0)) <= 0):
+                raise ValueError(
+                    "robot_qa_max_frames must be positive, got "
+                    f"{data_args.robot_qa_max_frames}"
+                )
         self.horizon = data_args.action_horizon
         self.num_frames = data_args.num_frames
         self.stride = data_args.frame_stride
@@ -321,6 +643,114 @@ class RobotFlowMatchingDataset(Dataset):
         if data_args.state_history and not data_args.image_history:
             raise ValueError("--state_history is frame-aligned to the image history; "
                              "it requires --image_history True")
+        human_prompt_mode = bool(
+            data_args.human_prompt_dirs
+            or getattr(data_args, "human_prompt_enabled", False)
+        )
+        if human_prompt_mode:
+            if data_args.human_prompt_stride <= 0:
+                raise ValueError(
+                    f"human_prompt_stride must be positive, got {data_args.human_prompt_stride}"
+                )
+            if data_args.human_prompt_max_frames <= 0:
+                raise ValueError(
+                    "human_prompt_max_frames must be positive, got "
+                    f"{data_args.human_prompt_max_frames}"
+                )
+            if (not np.isfinite(data_args.human_prompt_source_fps)
+                    or data_args.human_prompt_source_fps <= 0):
+                raise ValueError(
+                    "human_prompt_source_fps must be positive and finite, got "
+                    f"{data_args.human_prompt_source_fps}"
+                )
+        if (data_args.explicit_video_timestamps
+                and not (human_prompt_mode or self._unprompted_pick_only_roots)):
+            raise ValueError(
+                "--explicit_video_timestamps requires human-prompt mode or "
+                "--unprompted_pick_only_dirs (standalone pick stream)"
+            )
+        # ---- segment-level prompt mode (bins task) ----
+        if getattr(data_args, "human_prompt_segments", False) and not human_prompt_mode:
+            raise ValueError("--human_prompt_segments requires --human_prompt_dirs")
+        p_full = float(getattr(data_args, "human_prompt_full_episode_prob", 0.0))
+        if not 0.0 <= p_full <= 1.0:
+            raise ValueError(f"human_prompt_full_episode_prob must be in [0, 1], got {p_full}")
+        if p_full > 0 and not getattr(data_args, "human_prompt_segments", False):
+            raise ValueError("--human_prompt_full_episode_prob requires --human_prompt_segments")
+        self._qa_mix = None
+        if getattr(data_args, "subtask_format_mix", ""):
+            if not getattr(data_args, "human_prompt_segments", False):
+                raise ValueError("--subtask_format_mix requires --human_prompt_segments")
+            if not data_args.predict_subtask:
+                raise ValueError("--subtask_format_mix requires --predict_subtask True")
+            parse_format_mix, train_questions = self._fmt.parse_format_mix, self._fmt.train_questions
+            self._qa_mix = parse_format_mix(data_args.subtask_format_mix)
+            # The stamped --subtask_question is what serving asks; with a QA mix the
+            # training questions come from the format pools instead, so the stamp must
+            # be one of the TRAINED phrasings of a mixed format or serving asks an
+            # out-of-distribution question (silent degradation under attends).
+            trained = {q for fmt, _ in self._qa_mix for q in train_questions(fmt)}
+            # 'where' phrasings are TEMPLATES: the object is substituted per sample.
+            # A template stamped as the serve question would ask a literal "{obj}".
+            if "{obj}" in data_args.subtask_question:
+                raise ValueError(
+                    f"--subtask_question {data_args.subtask_question!r} is a 'where' "
+                    f"template; serving cannot fill it. Stamp a concrete question.")
+            if data_args.subtask_question not in trained:
+                raise ValueError(
+                    f"--subtask_question {data_args.subtask_question!r} is not a trained "
+                    f"phrasing of any format in --subtask_format_mix "
+                    f"{data_args.subtask_format_mix!r}; serving would ask an "
+                    f"out-of-distribution question")
+        p_order = float(getattr(data_args, "order_sample_prob", 0.0))
+        if not 0.0 <= p_order <= 1.0:
+            raise ValueError(f"order_sample_prob must be in [0, 1], got {p_order}")
+        if p_order > 0 and self._qa_mix is None:
+            raise ValueError("--order_sample_prob requires --subtask_format_mix "
+                             "(order samples supervise a bins QA answer)")
+        if p_order > 0 and not getattr(self._fmt, "SUPPORTS_ORDER_SAMPLES", False):
+            raise ValueError(
+                f"--subtask_task {data_args.subtask_task!r} has no order ambiguity to "
+                f"supervise; --order_sample_prob must be 0, got {p_order}")
+        p_absent = float(getattr(data_args, "qa_where_absent_prob", 0.0))
+        if not 0.0 <= p_absent <= 1.0:
+            raise ValueError(f"qa_where_absent_prob must be in [0, 1], got {p_absent}")
+        if self._qa_mix is not None and any(
+                n in _FORCE_FULL_PROMPT_FORMATS for n, _ in self._qa_mix):
+            # These formats force a full-episode prompt, so the full pools must exist
+            # AND have been validated against every robot episode -- which only
+            # happens when the full-episode probability is nonzero.
+            if float(getattr(data_args, "human_prompt_full_episode_prob", 0.0)) <= 0:
+                raise ValueError(
+                    f"--subtask_format_mix includes a full-prompt-only format "
+                    f"{sorted(set(_FORCE_FULL_PROMPT_FORMATS) & {n for n, _ in self._qa_mix})}; "
+                    f"it requires --human_prompt_full_episode_prob > 0")
+        if self._qa_mix is not None and any(n == "where" for n, _ in self._qa_mix):
+            if not getattr(self._fmt, "HAS_WHERE", False):
+                raise ValueError(f"--subtask_task {data_args.subtask_task!r} has no "
+                                 f"'where' format")
+            # 'where' answers describe the DRAWN clip, exactly like 'demo'.
+            if (not getattr(data_args, "human_prompt_dirs", None)
+                    and not getattr(data_args, "human_prompt_enabled", False)):
+                raise ValueError("the 'where' QA format asks about the drawn human "
+                                 "prompt clip; it requires --human_prompt_dirs (or a "
+                                 "human-prompt serve config)")
+        # Serving clears human_prompt_dirs (the demo arrives via /set_prompt) but keeps
+        # the human_prompt_enabled mode flag -- either satisfies the 'demo' format.
+        if (self._qa_mix is not None and any(n == "demo" for n, _ in self._qa_mix)
+                and not getattr(data_args, "human_prompt_dirs", None)
+                and not getattr(data_args, "human_prompt_enabled", False)):
+            raise ValueError("the 'demo' QA format describes the drawn human prompt "
+                             "clip; it requires --human_prompt_dirs (or a human-prompt "
+                             "serve config)")
+        # V3+ (image_history + explicit_video_timestamps): both videos get their own
+        # metadata entry in _build_item -- the demo clip's sampled content times and the
+        # history's constant slot ladder (human_prompt.history_video_metadata).
+        if data_args.image_history and int(data_args.history_max_pixels) <= 0:
+            raise ValueError(
+                f"history_max_pixels must be positive with image_history, got "
+                f"{data_args.history_max_pixels}"
+            )
         num_dims = len(self.active_dims) if self.active_dims is not None else None
         if data_args.action_space == "ee6d":
             # The FK conversion consumes the SELECTED 7 joint dims and emits EE_DIM;
@@ -348,8 +778,16 @@ class RobotFlowMatchingDataset(Dataset):
         self.episodes = self._scan_episodes(data_args)
         if not self.episodes:
             raise ValueError(f"No usable episodes found under: {data_args.robot_data_dirs}")
-        print(f"[RobotFlowMatchingDataset] {len(self.episodes)} training episodes")
+        if self._unprompted_pick_only_roots:
+            physical = len({episode["video_path"] for episode in self.episodes})
+            print(
+                f"[RobotFlowMatchingDataset] {len(self.episodes)} training records "
+                f"from {physical} physical episodes"
+            )
+        else:
+            print(f"[RobotFlowMatchingDataset] {len(self.episodes)} training episodes")
 
+        self.human_prompt_full_pools = None  # set by the segment-mode scan
         self.human_prompt_pools = self._scan_human_prompts(data_args)
 
         # fps for windowed single-frame wrist decode (avoids full-decoding the video).
@@ -422,9 +860,12 @@ class RobotFlowMatchingDataset(Dataset):
     # ------------------------------------------------------------------
     def _scan_human_prompts(self, data_args: RobotDataArguments):
         """Build {key: [video paths]} pools of human demo clips and verify every robot
-        episode's subtask labels match exactly one pool key. Returns None when off."""
+        episode's subtask labels match exactly one pool key. Returns None when off.
+        Segment mode (--human_prompt_segments) builds sub-clip pools instead."""
         if not data_args.human_prompt_dirs:
             return None
+        if getattr(data_args, "human_prompt_segments", False):
+            return self._scan_human_prompt_segments(data_args)
         pools = {}
         for spec in data_args.human_prompt_dirs.split(","):
             spec = spec.strip()
@@ -434,6 +875,19 @@ class RobotFlowMatchingDataset(Dataset):
             key, root = key.strip(), Path(root_str.strip())
             if not root_str or not key:
                 raise ValueError(f"human_prompt_dirs entry {spec!r} is not 'key=path'")
+            info_path = root / "meta" / "info.json"
+            if not info_path.exists():
+                raise ValueError(
+                    f"human-prompt pool {root} has no meta/info.json; cannot verify FPS"
+                )
+            pool_fps = float(json.load(open(info_path)).get("fps", 0))
+            if not math.isclose(
+                pool_fps, data_args.human_prompt_source_fps, rel_tol=0.0, abs_tol=1e-6
+            ):
+                raise ValueError(
+                    f"human-prompt pool {root} declares fps={pool_fps}, but training "
+                    f"uses human_prompt_source_fps={data_args.human_prompt_source_fps}"
+                )
             vids = []
             for chunk_dir in sorted((root / "videos").glob("chunk-*")):
                 cam_dir = chunk_dir / f"observation.images.{data_args.camera}"
@@ -441,58 +895,329 @@ class RobotFlowMatchingDataset(Dataset):
             if not vids:
                 raise ValueError(f"no {data_args.camera} videos under {root}")
             holdout = data_args.human_prompt_holdout
+            if holdout < 0 or holdout >= len(vids):
+                raise ValueError(
+                    f"human_prompt_holdout must be in [0, {len(vids) - 1}] for pool "
+                    f"{key!r}, got {holdout}"
+                )
             train_vids = vids[:-holdout] if 0 < holdout < len(vids) else vids
+            if key in pools:
+                raise ValueError(f"duplicate human-prompt pool key {key!r}")
             pools[key] = [str(v) for v in train_vids]
             print(f"[RobotFlowMatchingDataset] human-prompt pool '{key}': "
                   f"{len(train_vids)} train clips ({len(vids) - len(train_vids)} held out) "
                   f"from {root}")
         self.human_prompt_pools = pools  # _human_prompt_key reads it during validation
-        unmatched = [Path(ep["video_path"]).name for ep in self.episodes
-                     if self._human_prompt_key(ep) is None]
-        if unmatched:
+        invalid = []
+        for episode in self.episodes:
+            if episode.get("sample_mode") in (
+                    "standalone_action", "standalone_robot_qa"):
+                # This bypass is available only to records produced from the exact-root
+                # allowlist, after _scan_episodes validated their one-segment labels.
+                continue
+            matches = {
+                key
+                for segment in episode.get("subtasks", [])
+                for key in pools
+                if key in segment["task"]
+            }
+            if len(matches) != 1:
+                invalid.append((Path(episode["video_path"]).name, sorted(matches)))
+        if invalid:
             raise ValueError(
-                f"{len(unmatched)} episodes have no subtask label containing any human-"
-                f"prompt pool key {sorted(pools)} (first: {unmatched[:3]}); cannot pair "
-                "a demo video. Fix the keys or the labels.")
+                f"{len(invalid)} episodes do not match exactly one human-prompt pool key "
+                f"from {sorted(pools)} (first: {invalid[:3]}); cannot pair a demo video. "
+                "Fix missing/overlapping keys or the labels.")
         return pools
 
-    def _human_prompt_key(self, episode: Dict) -> Optional[str]:
+    def _scan_human_prompt_segments(self, data_args: RobotDataArguments):
+        """Segment mode: pools keyed by the EXACT task string, entries are sub-clip
+        ranges (path, start, end) from each human dataset's subtask_labels.json.
+        Also builds self.human_prompt_full_pools keyed by the episode's ordered
+        task-string tuple, holding full-episode ranges, for the full-prompt mix.
+        Holdout: the LAST human_prompt_holdout episodes (sorted order) of each human
+        dataset are excluded from BOTH pool kinds (they are the eval prompts)."""
+        pools: Dict[str, list] = {}
+        full_pools: Dict[tuple, list] = {}
+        for root_str in data_args.human_prompt_dirs.split(","):
+            root = Path(root_str.strip())
+            if not root_str.strip():
+                continue
+            if "=" in root_str:
+                raise ValueError(
+                    f"--human_prompt_segments takes bare dataset paths, got {root_str!r}"
+                )
+            info_path = root / "meta" / "info.json"
+            if not info_path.exists():
+                raise ValueError(f"human-prompt dataset {root} has no meta/info.json")
+            pool_fps = float(json.load(open(info_path)).get("fps", 0))
+            if not math.isclose(
+                pool_fps, data_args.human_prompt_source_fps, rel_tol=0.0, abs_tol=1e-6
+            ):
+                raise ValueError(
+                    f"human-prompt dataset {root} declares fps={pool_fps}, but training "
+                    f"uses human_prompt_source_fps={data_args.human_prompt_source_fps}"
+                )
+            # Load the label index first so exclusions can be validated against the
+            # complete human dataset, then remove them BEFORE the ordinary per-key
+            # holdout. An excluded clip can therefore never consume a holdout slot.
+            chunk_labels = []
+            known_episode_names = set()
+            for chunk_dir in sorted((root / "videos").glob("chunk-*")):
+                labels_path = chunk_dir / "subtask_labels.json"
+                if not labels_path.exists():
+                    raise ValueError(f"segment mode needs {labels_path}")
+                labels = json.load(open(labels_path))
+                chunk_labels.append((chunk_dir, labels))
+                known_episode_names.update(labels)
+            excluded = load_train_exclude_episodes(root, known_episode_names)
+            n_eps, n_held = 0, 0
+            for chunk_dir, labels in chunk_labels:
+                cam_dir = chunk_dir / f"observation.images.{data_args.camera}"
+                keys = sorted(key for key in labels if key not in excluded)
+                holdout = data_args.human_prompt_holdout
+                if holdout < 0 or holdout >= len(keys):
+                    raise ValueError(
+                        f"human_prompt_holdout must be in [0, {len(keys) - 1}] for "
+                        f"{root.name}, got {holdout}"
+                    )
+                held: set = set()
+                if getattr(data_args, "human_prompt_holdout_per_key", False):
+                    # Hold out the last `holdout` episodes of each CONFIGURATION, so
+                    # every configuration keeps an unseen eval demo (a dataset-tail
+                    # holdout would take them all from whichever configuration happens
+                    # to sort last).
+                    by_key: Dict[tuple, list] = {}
+                    for key in keys:
+                        by_key.setdefault(self._fmt.human_full_key(labels[key]), []).append(key)
+                    for full_key, group in sorted(by_key.items()):
+                        if holdout >= len(group):
+                            raise ValueError(
+                                f"human_prompt_holdout={holdout} would empty the "
+                                f"{full_key} pool of {root.name} ({len(group)} episodes)")
+                        held.update(group[len(group) - holdout:] if holdout else [])
+                    train_keys = [k for k in keys if k not in held]
+                else:
+                    train_keys = keys[:-holdout] if holdout else keys
+                n_held += len(keys) - len(train_keys)
+                for key in train_keys:
+                    segs = labels[key]
+                    video = cam_dir / key
+                    if not video.exists():
+                        raise ValueError(f"missing human demo video {video}")
+                    for pool_key, lo, hi in self._fmt.human_pool_entries(segs):
+                        pools.setdefault(pool_key, []).append((str(video), lo, hi))
+                    full_pools.setdefault(self._fmt.human_full_key(segs), []).append(
+                        (str(video), 0, int(segs[-1]["end"]))
+                    )
+                    n_eps += 1
+            print(f"[RobotFlowMatchingDataset] human-prompt segments from {root.name}: "
+                  f"{n_eps} train episodes ({n_held} held out, "
+                  f"{len(excluded)} train-excluded)")
+        for task in sorted(pools):
+            print(f"[RobotFlowMatchingDataset]   pool {task!r}: {len(pools[task])} sub-clips")
+        self.human_prompt_pools = pools
+        self.human_prompt_full_pools = full_pools
+
+        # Every robot segment task must have a sub-clip pool; with the full-prompt mix
+        # on, every robot episode's ordered combo must have full-episode demos too.
+        # 4-phase robot labels validate through their combined legacy strings, the
+        # keys _human_prompt_key/_extract_human_prompt will look up at sample time.
+        is_phase_task = self._fmt.is_phase_task
+        missing, missing_full = set(), set()
+        for episode in self.episodes:
+            segs = episode.get("subtasks", [])
+            if not segs:
+                raise ValueError(
+                    f"segment mode requires subtask labels on every robot episode; "
+                    f"{Path(episode['video_path']).name} has none"
+                )
+            # Labels must tile every sampleable timestep: a gap would fall back to
+            # default_prompt, which is not a pool key (KeyError hours into training).
+            n = len(episode["states"])
+            if (segs[0]["start"] != 0 or segs[-1]["end"] != n - 1
+                    or any(b["start"] != a["end"] + 1 for a, b in zip(segs, segs[1:]))):
+                raise ValueError(
+                    f"subtask labels do not tile [0, {n - 1}] in "
+                    f"{Path(episode['video_path']).name}: "
+                    f"{[(s['start'], s['end']) for s in segs]}")
+            tasks = [s["task"] for s in segs]
+            if episode.get("sample_mode") in (
+                    "standalone_action", "standalone_robot_qa"):
+                if not self._fmt.is_standalone_pick(tasks):
+                    # Defensive re-check: only an exact opted-in standalone pick may
+                    # bypass human-prompt pool and destination/combo validation.
+                    raise ValueError(
+                        f"invalid unprompted pick-only record "
+                        f"{Path(episode['video_path']).name}: {tasks}"
+                    )
+                continue
+            # Order samples pick the second placement's pair (index 2/3) and pair it
+            # with a first-pick-segment observation: only valid on 4-phase episodes.
+            # Single-pair phase episodes (cup: pick/place) are allowed alongside --
+            # they have no order ambiguity and are simply never order-sampled
+            # (the len==4 eligibility check in _build_item).
+            if getattr(data_args, "order_sample_prob", 0.0) > 0 and (
+                    len(tasks) not in (2, 4) or not is_phase_task(tasks[0])):
+                raise ValueError(
+                    f"--order_sample_prob requires phase-split labels (4 segments, "
+                    f"or 2 for single-pair episodes); "
+                    f"{Path(episode['video_path']).name} has {len(tasks)}: {tasks}")
+            # Fail at startup, not at the first unlucky sample: the 'phase' format
+            # needs 4-phase labels, and 'current' would reintroduce the joint
+            # (block,bin) conditioning that 4-phase labels exist to remove.
+            if self._qa_mix is not None:
+                fmts = {f for f, _ in self._qa_mix}
+                bad = ("current" if is_phase_task(tasks[0]) and "current" in fmts else
+                       "phase" if not is_phase_task(tasks[0]) and "phase" in fmts else None)
+                if bad:
+                    raise ValueError(
+                        f"--subtask_format_mix includes {bad!r} but "
+                        f"{Path(episode['video_path']).name} carries "
+                        f"{'4-phase' if is_phase_task(tasks[0]) else 'legacy 2-segment'} "
+                        f"labels ({data_args.robot_subtask_labels_file}): incompatible")
+            for i, _ in enumerate(tasks):
+                key = self._fmt.robot_pool_key(tasks, i)
+                if key not in pools:
+                    missing.add(key)
+            if getattr(data_args, "human_prompt_full_episode_prob", 0.0) > 0:
+                combo = self._fmt.robot_full_key(tasks)
+                if combo not in full_pools:
+                    missing_full.add(combo)
+        if missing:
+            raise ValueError(
+                f"robot segment tasks with no human sub-clip pool: {sorted(missing)}; "
+                f"pools have {sorted(pools)}")
+        if missing_full:
+            raise ValueError(
+                f"robot combos with no full-episode human demos: {sorted(missing_full)}")
+        return pools
+
+    @property
+    def _fmt(self):
+        """The per-task QA module (--subtask_task). A property, not an attribute: see
+        subtask_formats_module."""
+        return subtask_formats_module(self._subtask_task)
+
+    def _segment_index_at(self, episode: Dict, t: int) -> int:
+        for i, segment in enumerate(episode["subtasks"]):
+            if segment["start"] <= t <= segment["end"]:
+                return i
+        raise ValueError(
+            f"t={t} outside every subtask segment of {episode.get('video_path')}")
+
+    def _human_prompt_key(self, episode: Dict, t: Optional[int] = None) -> Optional[str]:
+        if getattr(self.data_args, "human_prompt_segments", False):
+            # Segment mode: the pool key is the exact task string at timestep t.
+            # 4-phase robot labels map to the combined legacy string (human labels
+            # stay 2-segment: a full placement demo prompts both of its phases).
+            assert t is not None, "segment mode needs the sampled timestep"
+            return self._fmt.robot_pool_key([s["task"] for s in episode["subtasks"]],
+                                            self._segment_index_at(episode, t))
         for segment in episode.get("subtasks", []):
             for key in self.human_prompt_pools:
                 if key in segment["task"]:
                     return key
         return None
 
-    def _extract_human_prompt(self, episode: Dict) -> List[Image.Image]:
+    def _extract_human_prompt(
+        self, episode: Dict, t: Optional[int] = None, force_key: Optional[str] = None,
+        force_full: bool = False,
+    ) -> tuple[List[Image.Image], List[int], int]:
         """A same-task human demo clip, freshly drawn per call. Stride-sampled with the
         final frame (the grasp outcome) forced in; uniformly re-spaced when over
         max_frames.
 
-        The sampled frames are CACHED per clip (per dataloader worker): the pools hold
-        only a few dozen clips, each ~3 s, yet every sample draws one -- without the
-        cache the repeated full-clip decodes dominate the dataloader and starve the GPU.
-        Sampling indices are deterministic per clip, so the cache is exact (~1 MB/frame,
-        ~600 MB/worker for 55 clips x 12 frames). Only the random DRAW and the
-        augmentation vary per sample, and _augment returns new images, so sharing the
-        cached PIL frames is safe."""
-        path = random.choice(self.human_prompt_pools[self._human_prompt_key(episode)])
-        self._last_prompt_path = path  # provenance for the QWEN_NAN_DEBUG ring buffer
+        Segment mode: pool entries are (path, start, end) sub-clip ranges of the
+        segment matching the robot subtask at t -- or, with probability
+        human_prompt_full_episode_prob, the FULL human episode of this robot episode's
+        combo. Sampled indices are RELATIVE to the drawn range (a served sub-clip
+        upload starts at its own frame 0), so the timestamp contract is identical for
+        sub-clips, full episodes, and the legacy whole-clip pools.
+
+        The sampled frames are CACHED per (clip, range) (per dataloader worker): the
+        pools hold only a few dozen clips, each ~3 s, yet every sample draws one --
+        without the cache the repeated full-clip decodes dominate the dataloader and
+        starve the GPU. Sampling indices are deterministic per range, so the cache is
+        exact. Only the random DRAW and the augmentation vary per sample, and _augment
+        returns new images, so sharing the cached PIL frames is safe."""
+        if getattr(self.data_args, "human_prompt_segments", False):
+            p_full = float(getattr(self.data_args, "human_prompt_full_episode_prob", 0.0))
+            if force_key is not None:
+                # Order sample: the prompt MUST be the forced sub-clip pool (never a
+                # full episode -- a full demo of this data is green-first and would
+                # contradict the supervised answer).
+                self._last_prompt_keys = (force_key,)
+                path, lo, hi = random.choice(self.human_prompt_pools[force_key])
+            elif force_full or (p_full > 0 and random.random() < p_full):
+                combo = self._fmt.robot_full_key([s["task"] for s in episode["subtasks"]])
+                self._last_prompt_keys = combo
+                path, lo, hi = random.choice(self.human_prompt_full_pools[combo])
+            else:
+                key = self._human_prompt_key(episode, t)
+                self._last_prompt_keys = (key,)
+                path, lo, hi = random.choice(self.human_prompt_pools[key])
+        else:
+            key = self._human_prompt_key(episode)
+            self._last_prompt_keys = (key,)
+            path = random.choice(self.human_prompt_pools[key])
+            lo, hi = 0, -1  # -1 = clip end, resolved after decode
+        self._last_prompt_path = f"{path}[{lo}:{hi}]" if hi != -1 else path
+        cache_key = (path, lo, hi)
         if not hasattr(self, "_prompt_clip_cache"):
             self._prompt_clip_cache = {}
-        frames = self._prompt_clip_cache.get(path)
-        if frames is None:
+        cached = self._prompt_clip_cache.get(cache_key)
+        if cached is None:
+            from qwenvl.action_expert.human_prompt import sample_prompt_indices
+
+            video, _, _ = read_video(path, pts_unit="sec", output_format="THWC")
+            if hi == -1:
+                hi = len(video) - 1
+            if not 0 <= lo <= hi < len(video):
+                raise ValueError(
+                    f"segment [{lo}, {hi}] outside {path} ({len(video)} frames)")
+            total = hi - lo + 1  # range-relative frame count: uploads start at frame 0
+            idxs = sample_prompt_indices(
+                total,
+                self.data_args.human_prompt_stride,
+                self.data_args.human_prompt_max_frames,
+            )
+            frames = [Image.fromarray(video[lo + i].numpy()) for i in idxs]
+            cached = (frames, idxs, total)
+            self._prompt_clip_cache[cache_key] = cached
+        frames, idxs, total = cached
+        return list(frames), list(idxs), int(total)
+
+    def _extract_robot_qa_video(
+        self, episode: Dict,
+    ) -> tuple[List[Image.Image], List[int], int]:
+        """Sparse whole-episode cam_high clip for standalone-pick robot QA.
+
+        The cache is per dataloader worker and keyed by video path.  Sampling is
+        deterministic and always includes the outcome frame, while augmentation is
+        applied later to fresh list/PIL objects just like a human prompt clip.
+        """
+        path = episode["video_path"]
+        if not hasattr(self, "_robot_qa_video_cache"):
+            self._robot_qa_video_cache = {}
+        cached = self._robot_qa_video_cache.get(path)
+        if cached is None:
+            from qwenvl.action_expert.human_prompt import sample_prompt_indices
+
             video, _, _ = read_video(path, pts_unit="sec", output_format="THWC")
             total = len(video)
-            idxs = list(range(0, total, self.data_args.human_prompt_stride))
-            if idxs[-1] != total - 1:
-                idxs.append(total - 1)
-            max_frames = self.data_args.human_prompt_max_frames
-            if len(idxs) > max_frames:
-                sel = np.linspace(0, len(idxs) - 1, max_frames)
-                idxs = [idxs[int(round(s))] for s in sel]
-            frames = [Image.fromarray(video[i].numpy()) for i in idxs]
-            self._prompt_clip_cache[path] = frames
-        return list(frames)
+            if total <= 0:
+                raise ValueError(f"empty standalone-pick robot video {path}")
+            indices = sample_prompt_indices(
+                total,
+                int(self.data_args.robot_qa_stride),
+                int(self.data_args.robot_qa_max_frames),
+            )
+            frames = [Image.fromarray(video[index].numpy()) for index in indices]
+            cached = (frames, indices, total)
+            self._robot_qa_video_cache[path] = cached
+        frames, indices, total = cached
+        return list(frames), list(indices), int(total)
 
     # ------------------------------------------------------------------
     # Episode discovery
@@ -508,19 +1233,43 @@ class RobotFlowMatchingDataset(Dataset):
 
     def _scan_episodes(self, data_args: RobotDataArguments) -> List[Dict]:
         episodes = []
+        self._train_exclude_episodes = {}
         for root_str in data_args.robot_data_dirs.split(","):
             root = Path(root_str.strip())
             if not root.exists():
                 print(f"[RobotFlowMatchingDataset] skipping missing root {root}")
                 continue
+            canonical_root = str(root.resolve())
+            unprompted_pick_only = canonical_root in self._unprompted_pick_only_roots
+            info_path = root / "meta" / "info.json"
+            source_fps = (
+                float(json.load(open(info_path)).get("fps", 30.0))
+                if info_path.exists() else 30.0
+            )
+            if not np.isfinite(source_fps) or source_fps <= 0:
+                raise ValueError(f"dataset {root} declares invalid fps={source_fps}")
 
             chunk_dirs = sorted((root / "data").glob("chunk-*"))
+            known_episode_names = {
+                parquet_path.stem + ".mp4"
+                for chunk_dir in chunk_dirs
+                for parquet_path in chunk_dir.glob("episode_*.parquet")
+            }
+            excluded = load_train_exclude_episodes(root, known_episode_names)
+            if excluded:
+                self._train_exclude_episodes[str(root)] = sorted(excluded)
+                print(
+                    f"[RobotFlowMatchingDataset] {root.name}: skipping "
+                    f"{len(excluded)} episode(s) from meta/{_TRAIN_EXCLUDE_FILE}"
+                )
             subtask_labels = {}
             instructions = {}
             per_root = []
             for chunk_dir in chunk_dirs:
                 chunk_name = chunk_dir.name
-                labels_path = root / "videos" / chunk_name / "subtask_labels.json"
+                labels_path = (root / "videos" / chunk_name
+                               / getattr(data_args, "robot_subtask_labels_file",
+                                         "subtask_labels.json"))
                 if labels_path.exists():
                     with open(labels_path) as f:
                         subtask_labels.update(json.load(f))
@@ -535,6 +1284,8 @@ class RobotFlowMatchingDataset(Dataset):
 
                 for parquet_path in sorted(chunk_dir.glob("episode_*.parquet")):
                     video_name = parquet_path.stem + ".mp4"
+                    if video_name in excluded:
+                        continue
                     # PyAV (libdav1d) decodes the raw AV1 LeRobot videos directly; h264
                     # fallback if present. No convert_av1.sh step required.
                     video_path = self._resolve_video(root, chunk_name, data_args.camera, video_name)
@@ -608,12 +1359,48 @@ class RobotFlowMatchingDataset(Dataset):
                             "instruction": instructions.get(video_name),
                             "min_start": min_start,
                             "hist_min": hist_min,
+                            "source_root": canonical_root,
+                            "source_fps": source_fps,
+                            "sample_mode": "normal",
                         }
                     )
 
             # Same 75% split convention as PrototypeRobotDataset (sorted, first fraction).
             split_idx = int(len(per_root) * data_args.train_split)
-            episodes.extend(per_root[:split_idx])
+            selected = per_root[:split_idx]
+            if unprompted_pick_only:
+                paired_records = []
+                for episode in selected:
+                    tasks = [segment["task"] for segment in episode["subtasks"]]
+                    if not self._fmt.is_standalone_pick(tasks):
+                        raise ValueError(
+                            f"opted-in pick-only root {root} contains non-standalone-pick "
+                            f"episode {Path(episode['video_path']).name}: {tasks}"
+                        )
+                    segment = episode["subtasks"][0]
+                    if (int(segment["start"]) != 0
+                            or int(segment["end"]) != len(episode["states"]) - 1):
+                        raise ValueError(
+                            f"standalone-pick labels must tile the whole episode [0, "
+                            f"{len(episode['states']) - 1}] in "
+                            f"{Path(episode['video_path']).name}: {segment}"
+                        )
+                    paired_records.append({**episode, "sample_mode": "standalone_action"})
+                    if self._standalone_robot_qa_enabled:
+                        paired_records.append(
+                            {**episode, "sample_mode": "standalone_robot_qa"}
+                        )
+                episodes.extend(paired_records)
+                mode_summary = (
+                    "action/robot-QA"
+                    if self._standalone_robot_qa_enabled else "action-only"
+                )
+                print(
+                    f"[RobotFlowMatchingDataset] {root.name}: {len(selected)} standalone "
+                    f"pick episodes -> {len(paired_records)} {mode_summary} records"
+                )
+            else:
+                episodes.extend(selected)
         return episodes
 
     def _check_norm_stats_meta(self, meta: Dict, data_args: RobotDataArguments, path: str):
@@ -660,11 +1447,25 @@ class RobotFlowMatchingDataset(Dataset):
                     f"norm stats at {path} were computed with {key}={theirs!r} but this "
                     f"run uses {ours!r} -- wrong action space, refusing to continue."
                 )
-        for key in ("robot_data_dirs", "train_split"):
-            if key in meta and meta[key] != getattr(data_args, key):
+        source_contract = {
+            "robot_data_dirs": data_args.robot_data_dirs,
+            "train_split": data_args.train_split,
+            "train_exclude_episodes": getattr(self, "_train_exclude_episodes", {}),
+        }
+        for key, ours in source_contract.items():
+            # Older artifacts did not stamp an empty exclusion map. Treat absent and
+            # empty as equivalent, but warn whenever either side has a nonempty,
+            # different selection. Source mismatch remains a warning for serving.
+            if key == "train_exclude_episodes":
+                theirs = meta.get(key, {})
+                should_compare = bool(theirs or ours)
+            else:
+                theirs = meta.get(key)
+                should_compare = key in meta
+            if should_compare and theirs != ours:
                 print(
                     f"[RobotFlowMatchingDataset] note: norm stats {path} were computed over "
-                    f"{key}={meta[key]!r} (this run: {getattr(data_args, key)!r}) -- fine when "
+                    f"{key}={theirs!r} (this run: {ours!r}) -- fine when "
                     "serving a frozen artifact; refit the FAST tokenizer + stats if this is a "
                     "NEW training dataset."
                 )
@@ -677,6 +1478,11 @@ class RobotFlowMatchingDataset(Dataset):
         #      (FAST is fit inside the normalized space the stats define).
         # This keeps stats attached to model artifacts, not dataset dirs, so a new
         # training mix can never silently overwrite the file an older served model reads.
+        # Robot-QA is a second *sampling record* for the same physical episode.  It has
+        # no action loss and must not count the ball trajectory twice in normalization;
+        # the paired standalone_action record is the one physical copy used here.  This
+        # also matches scripts/train_fast_tokenizer.py, which scans each parquet once.
+        norm_episodes = _episodes_for_norm_stats(self.episodes)
         explicit = Path(data_args.norm_stats_path) if data_args.norm_stats_path else None
         candidates = [(explicit, "--norm_stats_path")]
         if explicit is None and data_args.fast_tokenizer_path:
@@ -705,9 +1511,12 @@ class RobotFlowMatchingDataset(Dataset):
             "robot_data_dirs": data_args.robot_data_dirs,
             "train_split": data_args.train_split,
         }
+        train_exclusions = getattr(self, "_train_exclude_episodes", {})
+        if train_exclusions:
+            meta["train_exclude_episodes"] = train_exclusions
         # Fingerprint DAgger min_start gating so pre-gating caches are not reused for a
         # gated mix; only added when nonzero so existing plain-dataset caches stay valid.
-        total_min_start = sum(int(ep.get("min_start", 0)) for ep in self.episodes)
+        total_min_start = sum(int(ep.get("min_start", 0)) for ep in norm_episodes)
         if total_min_start:
             meta["min_start_frames"] = total_min_start
         # Same back-compat convention for the newer fields: only stamped when non-default.
@@ -755,7 +1564,7 @@ class RobotFlowMatchingDataset(Dataset):
         # Fail on an unwritable target BEFORE the minutes-long compute (a crash at the
         # write would also leave non-zero ranks polling until their 1h timeout).
         stats_path.parent.mkdir(parents=True, exist_ok=True)
-        stats = compute_norm_stats(self.episodes, self.horizon, self.delta_mask)
+        stats = compute_norm_stats(norm_episodes, self.horizon, self.delta_mask)
         stats["meta"] = meta
         # Atomic write so concurrent ranks don't read a partial file.
         fd, tmp = tempfile.mkstemp(dir=str(stats_path.parent), suffix=".tmp")
@@ -771,6 +1580,18 @@ class RobotFlowMatchingDataset(Dataset):
         # Virtual length (see dataset_epoch_multiplier): item i maps to episode
         # i % num_episodes in _build_item.
         return len(self.episodes) * max(1, int(getattr(self.data_args, "dataset_epoch_multiplier", 1)))
+
+    def second_per_grid_ts(self, video_grid_thw):
+        """Preserve the legacy call contract used by the local Qwen3 RoPE helper.
+
+        ``get_rope_index_3`` follows upstream Qwen3-VL and encodes video time through
+        textual timestamp tokens; it currently ignores these scalar values. Explicit
+        sparse-video timing is therefore handled by ``video_metadata`` above, not here.
+        """
+        if video_grid_thw is None:
+            return None
+        vp = self.processor.video_processor
+        return [vp.temporal_patch_size / vp.fps] * len(video_grid_thw)
 
     @property
     def lengths(self):
@@ -799,8 +1620,8 @@ class RobotFlowMatchingDataset(Dataset):
         hist_min = int(episode.get("hist_min", 0))
         lo = max(hist_min, t - (self.num_frames - 1) * self.stride)
         video, _, _ = read_video(
-            episode["video_path"], start_pts=lo / self.fps, end_pts=(t + 0.9) / self.fps,
-            pts_unit="sec", output_format="THWC",
+            episode["video_path"], start_pts=_seek_seconds(lo, self.fps),
+            end_pts=(t + 0.9) / self.fps, pts_unit="sec", output_format="THWC",
         )
         n = len(video)
         if n == 0:  # empty window -> full-decode fallback
@@ -821,7 +1642,7 @@ class RobotFlowMatchingDataset(Dataset):
         whole video. Used for wrist stills AND, in no-history mode, the current cam_high still
         (apply_chat_template does NOT apply max_pixels to pre-loaded PIL images, so we resize)."""
         video, _, _ = read_video(
-            path, start_pts=t / self.fps, end_pts=(t + 0.9) / self.fps,
+            path, start_pts=_seek_seconds(t, self.fps), end_pts=(t + 0.9) / self.fps,
             pts_unit="sec", output_format="THWC",
         )
         if len(video) == 0:  # t past the end / empty window -> full-decode fallback
@@ -836,7 +1657,15 @@ class RobotFlowMatchingDataset(Dataset):
         # --max_pixels ceiling. Because this one runs first and shrinks the image, raising
         # only --max_pixels changes nothing -- the image is already under the ceiling. To give
         # the wrist more resolution, raise --wrist_max_pixels AND --max_pixels together.
-        # (History frames never pass through here: they go to the video processor raw.)
+        # (History frames don't pass through here: their GATE 1 is _shrink_to_budget with
+        # --history_max_pixels, applied in _build_item after augmentation.)
+        return self._shrink_to_budget(img, budget)
+
+    @staticmethod
+    def _shrink_to_budget(img: Image.Image, budget: int) -> Image.Image:
+        """Downscale-only resize to <= budget pixels, aspect preserved (GATE-1 math shared
+        by the stills and, since V3, the cam_high history frames)."""
+        w, h = img.size
         if w * h > budget:
             scale = (budget / (w * h)) ** 0.5
             img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.BILINEAR)
@@ -887,16 +1716,60 @@ class RobotFlowMatchingDataset(Dataset):
 
     def _build_item(self, idx: int) -> Dict[str, torch.Tensor]:
         episode = self.episodes[idx % len(self.episodes)]
+        sample_mode = episode.get("sample_mode", "normal")
+        standalone_action = sample_mode == "standalone_action"
+        standalone_robot_qa = sample_mode == "standalone_robot_qa"
         num_steps = len(episode["states"])
         # min_start > 0 on DAgger episodes: only the human-correction segment may be a
         # training timestep. _extract_frames still gets the raw t, so the image history
         # reaches back past min_start into the policy's own mistake -- by design.
-        t = random.randint(int(episode.get("min_start", 0)), num_steps - 1)
+        # Robot-QA describes either the initial scene or the entire demonstration; its
+        # state prompt is anchored at the first sampleable frame.  The paired action
+        # record keeps the ordinary random-timestep action sampling.
+        robot_qa_choice = random.randrange(4) if standalone_robot_qa else None
+        t = (
+            int(episode.get("min_start", 0))
+            if standalone_robot_qa
+            else random.randint(int(episode.get("min_start", 0)), num_steps - 1)
+        )
+
+        # The QA format drawn for this sample, if any: the human-prompt block below
+        # reads it to decide whether the drawn clip must be a full episode.
+        qa_format = None
+        # Cleared per sample so a prompt-relative answer can never be built from the
+        # PREVIOUS sample's demo if a future edit ever skips the draw.
+        self._last_prompt_keys = None
+        self._last_prompt_path = None
+        # Track-A order sample (see RobotDataArguments.order_sample_prob): observation
+        # from the FIRST pick segment (both blocks on the table), prompt forced to the
+        # SECOND placement's sub-clip, answer from the second placement's pick phase.
+        # Language-only: flow loss masked (action_loss_mask=0), FAST labels ignored.
+        order_sample = (
+            sample_mode == "normal"
+            and
+            self._qa_mix is not None
+            and getattr(self.data_args, "order_sample_prob", 0.0) > 0
+            # Single-pair episodes (cup: pick/place only) have no order ambiguity --
+            # skipped BEFORE the RNG draw, so 4-segment episodes consume the same
+            # random sequence as when every episode was 4-segment.
+            and len(episode["subtasks"]) == 4
+            and random.random() < float(self.data_args.order_sample_prob)
+        )
+        if order_sample:
+            seg0 = episode["subtasks"][0]
+            t = random.randint(int(seg0["start"]), int(seg0["end"]))
 
         state = episode["states"][t]
         actions = make_action_chunk(episode["actions"], state, t, self.horizon, self.delta_mask)
         norm_state = quantile_normalize(state, self.norm_stats["state"])
         norm_actions = quantile_normalize(actions, self.norm_stats["actions"])
+        # Do not consume an RNG draw at probability zero: old recipes must preserve
+        # their exact augmentation/prompt-pairing sequence.  The state remains available
+        # above for target construction even when its prompt representation is masked.
+        current_state_masked = (
+            float(getattr(self, "_current_state_mask_prob", 0.0)) > 0.0
+            and random.random() < self._current_state_mask_prob
+        )
         # States at the image-history timesteps (oldest first, newest frame's state == the
         # current state above): SAME indices and edge-clamping as _extract_frames.
         norm_past = None
@@ -909,58 +1782,241 @@ class RobotFlowMatchingDataset(Dataset):
         aug_on = (self.data_args.image_aug and not getattr(self, "_aug_disabled", False)
                   and random.random() < self.data_args.image_aug_prob)
 
-        wrist_images = self._extract_wrist_images(episode, t)
+        # The standalone QA source is deliberately cam_high only.  Its questions
+        # describe that robot view/video, not an incidental wrist stream.
+        wrist_images = [] if standalone_robot_qa else self._extract_wrist_images(episode, t)
         if aug_on:
             wrist_images = [self._augment([im], geometric=False)[0] for im in wrist_images]
         subtask = self._subtask_at(episode, t)
 
-        if self.data_args.predict_subtask:
-            # The prompt is the episode's task instruction when the dataset carries one
-            # (videos/chunk-*/instructions.json, e.g. the ABC-130k conversion), else the
-            # fixed --subtask_question; the subtask is the assistant answer to predict.
-            task_text = episode.get("instruction") or self.data_args.subtask_question
-            # Mixed supervision: an episode with NO subtask labels contributes no language
-            # signal (no assistant turn; the VLM is supervised through FAST alone).
-            # Supervising the "waiting" fallback instead would teach the VLM a false
-            # description of the scene on every unlabeled sample. Labeled episodes are
-            # untouched, so datasets with and without labels mix freely in one run.
-            assistant_text = subtask if episode["subtasks"] else None
+        if standalone_action:
+            # Oracle skill conditioning for the low-level action learner, in the SAME
+            # assistant-role location that a generated phase occupies at inference.
+            # Its text labels are explicitly masked below (so terminal grasp frames do
+            # not train phase prediction), while FAST + flow remain enabled.  Training
+            # enforces expert_attends_subtask=True for this mode.
+            tasks = [segment["task"] for segment in episode["subtasks"]]
+            task_text = self.data_args.subtask_question
+            assistant_text = self._fmt.standalone_pick_answer("phase", tasks)
+        elif standalone_robot_qa:
+            # Robot-only visual grounding: ball is never placed in the human-prompt
+            # channel.  Initial-scene questions use frame zero; outcome questions use
+            # the full sparse cam_high demonstration (selected below).
+            tasks = [segment["task"] for segment in episode["subtasks"]]
+            object_answer = self._fmt.standalone_pick_answer("object", tasks)
+            phase_answer = self._fmt.standalone_pick_answer("phase", tasks)
+            qa_specs = (
+                ("initial", "What object is currently on the table?", object_answer),
+                (
+                    "initial",
+                    f"Given the task is to pick up the {object_answer}, what should "
+                    "the robot do next?",
+                    phase_answer,
+                ),
+                ("full", "What object did the robot pick up?", object_answer),
+                ("full", "What skill did the robot demonstrate?", phase_answer),
+            )
+            robot_qa_visual, task_text, assistant_text = qa_specs[robot_qa_choice]
+        elif self.data_args.predict_subtask:
+            if self._qa_mix is not None:
+                # Bins QA (subtask_formats_bins): per-sample format + random training
+                # phrasing; the compressed answer derives from the segment task at t.
+                # Phase-relative questions work for both sub-clip and full prompts.
+                choose_format = self._fmt.choose_format
+                train_questions = self._fmt.train_questions
+                fmt = qa_format = choose_format(self._qa_mix, random.random())
+                # The block/bin pools are object-neutral ("Which object should be
+                # picked up now?"), so every format applies to block AND cup
+                # episodes -- answers: "green"/"yellow"/"cup" (subtask_formats_bins).
+                ep_tasks = [s["task"] for s in episode["subtasks"]]
+                task_text = random.choice(train_questions(fmt))
+                # Context-aware: 4-phase labels take the paired factor from the
+                # adjacent segment; legacy labels behave exactly as bins_answer.
+                # Order samples answer for the SECOND placement's pick phase (idx 2)
+                # regardless of t -- the forced prompt is what makes that correct.
+                qa_idx = 2 if order_sample else self._segment_index_at(episode, t)
+                if fmt in ("demo", "where", "remaining"):
+                    # Prompt-relative: the answer describes the clip drawn below, so it
+                    # is filled in after _extract_human_prompt records the drawn keys.
+                    # For 'where', task_text stays the TEMPLATE until then -- the
+                    # queried object is drawn from what that clip actually showed.
+                    assistant_text = _PROMPT_ANSWER_PENDING
+                else:
+                    assistant_text = self._fmt.answer_at(fmt, ep_tasks, qa_idx)
+            else:
+                # The prompt is the episode's task instruction when the dataset carries
+                # one (videos/chunk-*/instructions.json, e.g. the ABC-130k conversion),
+                # else the fixed --subtask_question; the subtask is the assistant answer.
+                task_text = episode.get("instruction") or self.data_args.subtask_question
+                # Mixed supervision: an episode with NO subtask labels contributes no
+                # language signal (no assistant turn; the VLM is supervised through FAST
+                # alone). Supervising the "waiting" fallback instead would teach the VLM
+                # a false description of the scene on every unlabeled sample. Labeled
+                # episodes are untouched, so datasets with and without labels mix freely.
+                assistant_text = subtask if episode["subtasks"] else None
         else:
             # Subtask-input mode: the subtask IS the prompt; no subtask prediction (the VLM is
             # supervised only through FAST). At inference the subtask is provided by the caller.
             task_text = subtask
             assistant_text = None
-        prompt = format_robot_prompt(task_text, norm_state, past_states=norm_past)
+        prompt = format_robot_prompt(
+            task_text,
+            norm_state,
+            past_states=norm_past,
+            mask_current_state=current_state_masked,
+        )
 
         # Top-down cam_high (history video, or a single current still if image_history=False),
-        # then the current-timestep wrist still(s), then the text.
-        if self.data_args.image_history:
-            top_frames = self._extract_frames(episode, t)
-            if aug_on:
-                top_frames = self._augment(top_frames, geometric=True)
-            content = [{"type": "video", "video": top_frames}]
+        # then the current-timestep wrist still(s), then the text.  Standalone robot-QA
+        # instead gets either the initial cam_high still or a sparse WHOLE robot video.
+        robot_qa_indices = None
+        robot_qa_total = None
+        if standalone_robot_qa:
+            if robot_qa_visual == "full":
+                top_frames, robot_qa_indices, robot_qa_total = \
+                    self._extract_robot_qa_video(episode)
+                if aug_on:
+                    top_frames = self._augment(top_frames, geometric=True)
+                # Keep robot-QA on the same post-augmentation per-frame gate as robot
+                # history. This already freezes its factor-rounded Qwen grid, so raising
+                # the global whole-video budget for dense human prompts cannot sharpen QA.
+                top_frames = [
+                    self._shrink_to_budget(frame, self.data_args.history_max_pixels)
+                    for frame in top_frames
+                ]
+                media_content = [{"type": "video", "video": top_frames}]
+            else:
+                top_img = self._extract_single_frame(
+                    episode["video_path"], t, self.data_args.max_pixels
+                )
+                if aug_on:
+                    top_img = self._augment([top_img], geometric=True)[0]
+                top_frames = [top_img]
+                media_content = [{"type": "image", "image": top_img}]
+            content = [
+                {"type": "text", "text": "Robot demonstration:"},
+                *media_content,
+            ]
         else:
-            top_img = self._extract_single_frame(episode["video_path"], t, self.data_args.max_pixels)
-            if aug_on:
-                top_img = self._augment([top_img], geometric=True)[0]
-            top_frames = [top_img]
-            content = [{"type": "image", "image": top_img}]
-        content += [{"type": "image", "image": img} for img in wrist_images]
-        content.append({"type": "text", "text": prompt})
-        if self.human_prompt_pools is not None:
+            if self.data_args.image_history:
+                top_frames = self._extract_frames(episode, t)
+                if aug_on:
+                    top_frames = self._augment(top_frames, geometric=True)
+                # GATE-1 pre-resize AFTER augmentation (crop/rotate at native resolution,
+                # then shrink): see history_max_pixels. All frames share one size, as the
+                # video processor requires per clip.
+                top_frames = [self._shrink_to_budget(f, self.data_args.history_max_pixels)
+                              for f in top_frames]
+                content = [{"type": "video", "video": top_frames}]
+            else:
+                top_img = self._extract_single_frame(
+                    episode["video_path"], t, self.data_args.max_pixels
+                )
+                if aug_on:
+                    top_img = self._augment([top_img], geometric=True)[0]
+                top_frames = [top_img]
+                content = [{"type": "image", "image": top_img}]
+            content += [{"type": "image", "image": img} for img in wrist_images]
+        # Kept by reference: the 'where' format rewrites this text once the demo clip
+        # it asks about has been drawn (below).
+        text_entry = {"type": "text", "text": prompt}
+        content.append(text_entry)
+        human_prompt_drawn = False
+        if self.human_prompt_pools is not None and sample_mode == "normal":
             # Freshly drawn same-task human demo as a FIRST video, with structural text
             # markers so the two videos are unambiguous. Independent augmentation draw
             # (same per-clip convention as the other cameras). Serve must build the
             # identical structure (inference.templatize).
-            prompt_frames = self._extract_human_prompt(episode)
+            order_key = None
+            if order_sample:
+                order_key = self._fmt.robot_pool_key(
+                    [s["task"] for s in episode["subtasks"]], 2)
+            prompt_frames, prompt_indices, prompt_total = self._extract_human_prompt(
+                episode, t, force_key=order_key,
+                force_full=qa_format in _FORCE_FULL_PROMPT_FORMATS)
             if aug_on:
                 prompt_frames = self._augment(prompt_frames, geometric=True)
             content = [{"type": "text", "text": "Human demonstration:"},
                        {"type": "video", "video": prompt_frames},
                        {"type": "text", "text": "Robot view:"}] + content
+            human_prompt_drawn = True
+        if assistant_text is _PROMPT_ANSWER_PENDING:
+            if self.human_prompt_pools is None:
+                raise ValueError(f"the {qa_format!r} QA format requires human prompts")
+            keys = self._last_prompt_keys
+            if not keys:
+                raise ValueError(
+                    f"the {qa_format!r} QA format describes the drawn demo, but no "
+                    f"prompt clip was drawn for this sample")
+            if qa_format == "demo":
+                assistant_text = self._fmt.demo_answer(keys)
+            elif qa_format == "remaining":
+                assistant_text = self._fmt.remaining_answer(
+                    ep_tasks, qa_idx, prompt_keys=keys)
+            elif qa_format == "where":
+                shown, absent = self._fmt.where_objects(keys)
+                if not shown:
+                    raise ValueError(f"drawn prompt {keys} shows no object")
+                p_absent = float(getattr(self.data_args, "qa_where_absent_prob", 0.0))
+                pick_absent = bool(absent) and random.random() < p_absent
+                if pick_absent:
+                    obj = random.choice(absent)
+                else:
+                    # Prefer an object OTHER than the one being handled now: asking
+                    # about the current object duplicates the 'target' format, while
+                    # asking about another entry of the demo's mapping is the retrieval
+                    # skill this format exists for. Falls back to the current object
+                    # when the demo showed only that one (a sub-clip prompt).
+                    current = self._fmt.SYMBOL_NAME[
+                        self._fmt.phase_context(ep_tasks, qa_idx)[1]]
+                    others = [o for o in shown if o != current]
+                    obj = random.choice(others or shown)
+                # task_text is still the {obj} template here; fill it and rewrite the
+                # user turn in place (text_entry is the dict already in `content`).
+                task_text = self._fmt.where_question(task_text, obj)
+                text_entry["text"] = format_robot_prompt(
+                    task_text,
+                    norm_state,
+                    past_states=norm_past,
+                    mask_current_state=current_state_masked,
+                )
+                assistant_text = self._fmt.where_answer(keys, obj)
+            else:
+                raise ValueError(f"no deferred answer defined for format {qa_format!r}")
         messages = [{"role": "user", "content": content}]
         if assistant_text is not None:
             messages.append({"role": "assistant", "content": [{"type": "text", "text": assistant_text}]})
+
+        template_kwargs = {}
+        if getattr(self.data_args, "explicit_video_timestamps", False):
+            from qwenvl.action_expert.human_prompt import (
+                history_video_metadata, sampled_video_metadata,
+            )
+
+            # One metadata entry per video, in MESSAGE ORDER -- the processor zips the
+            # list with the <video> placeholders positionally. The human demo is
+            # prepended before the robot views, so its entry comes first; the cam_high
+            # history video (V3+, image_history=True) follows. Its ladder is constant
+            # slot times (see history_video_metadata), while the demo carries its real
+            # sampled content times. A missing or misordered entry would silently
+            # reintroduce Transformers' 24-fps fallback -- or swap the two ladders.
+            metadata = []
+            if human_prompt_drawn:
+                metadata.append(sampled_video_metadata(
+                    prompt_total, self.data_args.human_prompt_source_fps, prompt_indices
+                ))
+            if standalone_robot_qa and robot_qa_visual == "full":
+                metadata.append(sampled_video_metadata(
+                    robot_qa_total,
+                    float(episode.get("source_fps", self.fps)),
+                    robot_qa_indices,
+                ))
+            elif self.data_args.image_history and not standalone_robot_qa:
+                metadata.append(history_video_metadata(
+                    self.num_frames, self.stride,
+                    float(episode.get("source_fps", self.fps))))
+            if metadata:
+                template_kwargs["video_metadata"] = metadata
 
         data_dict = self.processor.apply_chat_template(
             messages,
@@ -969,6 +2025,7 @@ class RobotFlowMatchingDataset(Dataset):
             return_tensors="pt",
             add_generation_prompt=assistant_text is None,
             do_sample_frames=False, # NOTE: this is important! If not set, it will default to True and subsample the images
+            **template_kwargs,
         )
 
         input_ids = data_dict["input_ids"]
@@ -1019,26 +2076,33 @@ class RobotFlowMatchingDataset(Dataset):
                 if ids[i] == 151644 and ids[i + 1] == 77091:
                     subtask_token_mask[0, i:] = True
                     break
+        if standalone_action:
+            # Keep the oracle assistant tokens in input_ids (the action expert must
+            # condition on exactly what generated inference supplies) and keep their
+            # subtask_token_mask provenance, but remove ALL text CE.  Only the FAST
+            # postfix appended next is supervised by language loss for this record.
+            labels.fill_(IGNORE_INDEX)
         # Append FAST action tokens (supervised with cross-entropy) BEFORE computing
         # position_ids so positions cover the whole sequence. fast_token_mask marks the
         # appended region, which the model excludes from the continuous expert's attention.
         fast_token_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        if self.use_fast:
+        if self.use_fast and not standalone_robot_qa:
             input_ids, labels, fast_token_mask = self._append_fast_tokens(input_ids, labels, norm_actions)
             data_dict["input_ids"] = input_ids
             # FAST tokens are not part of the assistant subtask turn
             pad = torch.zeros(1, input_ids.shape[1] - subtask_token_mask.shape[1], dtype=torch.bool)
             subtask_token_mask = torch.cat([subtask_token_mask, pad], dim=1)
+        if order_sample or standalone_robot_qa:
+            # Language-only: the action chunk at t belongs to the natural (first-pick)
+            # conditioning, not the forced prompt -- or this is a descriptive robot-QA
+            # record. Drop FAST CE; flow is masked via action_loss_mask below.
+            labels = torch.where(fast_token_mask, torch.full_like(labels, IGNORE_INDEX), labels)
         data_dict["labels"] = labels
         data_dict["fast_token_mask"] = fast_token_mask
         data_dict["subtask_token_mask"] = subtask_token_mask
 
         video_grid_thw = data_dict.get("video_grid_thw")
-        second_per_grid_ts = None
-        if video_grid_thw is not None:
-            second_per_grid_ts = [
-                self.processor.video_processor.temporal_patch_size / self.processor.video_processor.fps
-            ] * len(video_grid_thw)
+        second_per_grid_ts = self.second_per_grid_ts(video_grid_thw)
 
         position_ids, _ = self.get_rope_index(
             self.merge_size,
@@ -1051,6 +2115,9 @@ class RobotFlowMatchingDataset(Dataset):
         data_dict["attention_mask"] = [input_ids.shape[1]]
 
         data_dict["actions"] = torch.from_numpy(np.ascontiguousarray(norm_actions)).float()
+        data_dict["action_loss_mask"] = torch.tensor(
+            0.0 if (order_sample or standalone_robot_qa) else 1.0
+        )
 
         if os.environ.get("QWEN_NAN_DEBUG"):
             # Provenance ring buffer for the nan trap in train_action_expert.compute_loss.
@@ -1061,6 +2128,9 @@ class RobotFlowMatchingDataset(Dataset):
                 self._recent_items = deque(maxlen=64)
             self._recent_items.append({
                 "video": episode["video_path"], "t": int(t),
+                "sample_mode": sample_mode,
+                "current_state_masked": bool(current_state_masked),
+                "robot_qa_choice": robot_qa_choice,
                 "prompt_clip": getattr(self, "_last_prompt_path", None),
                 "seq_len": int(input_ids.shape[1]),
                 "fast_len": int(fast_token_mask.sum()),
@@ -1098,14 +2168,24 @@ class RobotFlowMatchingDataset(Dataset):
         return input_ids, labels, fast_token_mask
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        original_i = i
+        strict_record = self.episodes[i % len(self.episodes)].get("sample_mode") in (
+            "standalone_action", "standalone_robot_qa"
+        )
         num_retries = 3
         for attempt in range(num_retries):
             try:
                 return self._build_item(i)
             except Exception as e:  # noqa: BLE001
                 print(f"[Try #{attempt}] Failed to fetch robot sample {i}: {e}")
-                i = random.randint(0, len(self.episodes) - 1)
-        return self._build_item(i)
+                # Never silently replace an opted-in ball action/QA record with an
+                # unrelated ordinary episode.  Transient video-decode failures retry
+                # the same physical recording; a persistent error then surfaces.
+                i = (
+                    original_i if strict_record
+                    else random.randint(0, len(self.episodes) - 1)
+                )
+        return self._build_item(original_i if strict_record else i)
 
 
 @dataclass
@@ -1115,6 +2195,9 @@ class RobotActionDataCollator(DataCollatorForSupervisedDataset):
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         batch = super().__call__(instances)
         batch["actions"] = torch.stack([inst["actions"] for inst in instances])
+        if "action_loss_mask" in instances[0]:
+            batch["action_loss_mask"] = torch.stack(
+                [inst["action_loss_mask"] for inst in instances])
         # Pad the per-token bool masks to the batched input_ids length (right pad = False:
         # padded positions are neither FAST nor subtask tokens). The base collator pads
         # input_ids to the max length in the batch, so match that.

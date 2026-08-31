@@ -1,0 +1,8 @@
+# Local secrets/configuration. Never commit W&B or Google credentials.
+portable.local.env
+*.service-account.json
+
+# Publisher staging and target bootstrap state.
+release-stage/
+downloads/
+*.partial

@@ -97,6 +97,12 @@ class Qwen3VLWithActionExpert(nn.Module):
         # and the subtask remains a pure VLM co-training signal. Lets inference run the
         # expert without waiting for subtask generation. Must match between train and serve.
         expert_attends_subtask: bool = True,
+        # Average the subtask-text CE per SAMPLE (mean of per-token means) instead of
+        # pooling all text tokens. With answer formats of very different lengths in one
+        # batch (a 3-token bin word vs a full task sentence) the pooled mean weights a
+        # sample by its answer length; per-sample weights each question equally.
+        # Training-time only (no labels at serve).
+        lm_loss_per_sample: bool = False,
     ):
         super().__init__()
         text_config = vlm.config.text_config
@@ -136,6 +142,7 @@ class Qwen3VLWithActionExpert(nn.Module):
         self.rtc_prefix_min_length = rtc_prefix_min_length
         self.rtc_prefix_max_length = rtc_prefix_max_length
         self.expert_attends_subtask = expert_attends_subtask
+        self.lm_loss_per_sample = lm_loss_per_sample
 
         width = expert_config.hidden_size
         # Flow-matching interface, kept in float32 like openpi.
@@ -287,7 +294,8 @@ class Qwen3VLWithActionExpert(nn.Module):
                 outputs = self.vlm.model(**vlm_kwargs)
             if need_lm_head:
                 lm_loss, fast_loss = self._language_losses(
-                    self.vlm.lm_head(outputs.last_hidden_state), labels, fast_token_mask
+                    self.vlm.lm_head(outputs.last_hidden_state), labels, fast_token_mask,
+                    lm_per_sample=self.lm_loss_per_sample,
                 )
         else:
             with torch.no_grad(), trunc:
@@ -297,10 +305,16 @@ class Qwen3VLWithActionExpert(nn.Module):
         return prefix_key_values, lm_loss, fast_loss
 
     @staticmethod
-    def _language_losses(logits, labels, fast_token_mask):
+    def _language_losses(logits, labels, fast_token_mask, lm_per_sample=False):
         """Next-token CE, split into the text/subtask term and the FAST action-token term
         (both are the KI cross-entropy objective; splitting is only for separate logging).
-        Standard shift: logits at position i predict the token at i+1."""
+        Standard shift: logits at position i predict the token at i+1.
+
+        lm_per_sample=True averages the text term per sample first (mean over each
+        sample's text tokens, then mean over samples that have any) so each QUESTION
+        contributes equally regardless of its answer length. FAST stays pooled: chunk
+        lengths are comparable across samples, so pooling is already balanced there."""
+        batch = labels.shape[0]
         shift_logits = logits[:, :-1].float().reshape(-1, logits.shape[-1])
         shift_labels = labels[:, 1:].reshape(-1)
         per_tok = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100, reduction="none")
@@ -311,7 +325,16 @@ class Qwen3VLWithActionExpert(nn.Module):
             is_fast = torch.zeros_like(valid)
         text_sel = valid & ~is_fast
         fast_sel = valid & is_fast
-        lm_loss = per_tok[text_sel].mean() if text_sel.any() else None
+        if not text_sel.any():
+            lm_loss = None
+        elif lm_per_sample:
+            tok = per_tok.view(batch, -1)
+            sel = text_sel.view(batch, -1).float()
+            counts = sel.sum(dim=1)
+            rows = counts > 0
+            lm_loss = ((tok * sel).sum(dim=1)[rows] / counts[rows]).mean()
+        else:
+            lm_loss = per_tok[text_sel].mean()
         fast_loss = per_tok[fast_sel].mean() if fast_sel.any() else None
         return lm_loss, fast_loss
 
@@ -453,6 +476,7 @@ class Qwen3VLWithActionExpert(nn.Module):
         subtask_token_mask: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
         time: Optional[torch.Tensor] = None,
+        action_loss_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> ActionExpertOutput:
         if attention_mask is None:
@@ -506,7 +530,7 @@ class Qwen3VLWithActionExpert(nn.Module):
         )
 
         if rtc_mask is None:
-            flow_loss = F.mse_loss(u_t, v_t)
+            per_sample = ((u_t - v_t) ** 2).mean(dim=(1, 2))  # (B,)
         else:
             # Paper change #3: only supervise the postfix. Zero the prefix tokens' loss and
             # reweight each sample's postfix by ah/postfix_count, so the overall mean equals
@@ -518,7 +542,16 @@ class Qwen3VLWithActionExpert(nn.Module):
             per_token = torch.where(
                 postfix_mask, per_token * (actions.shape[1] / postfix_count), torch.zeros_like(per_token)
             )
-            flow_loss = per_token.mean()
+            per_sample = per_token.mean(-1)  # (B,)
+        if action_loss_mask is None:
+            flow_loss = per_sample.mean()
+        else:
+            # Language-only samples (order samples, robot_data.order_sample_prob): their
+            # action chunk belongs to a DIFFERENT conditioning (the natural pairing), so
+            # the flow loss is masked per sample; their FAST labels arrive as -100 (no
+            # dataset change needed here) and only the subtask CE supervises them.
+            m = action_loss_mask.float()
+            flow_loss = (per_sample * m).sum() / m.sum().clamp(min=1.0)
         # KI objective: flow matching (alpha=1) + subtask CE + FAST action CE. The expert's
         # flow gradient is insulated from the VLM (detached KV); the VLM learns actions
         # only through the FAST/subtask cross-entropy terms.
