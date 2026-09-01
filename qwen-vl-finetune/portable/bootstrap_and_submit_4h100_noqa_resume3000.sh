@@ -15,7 +15,12 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ==============================================================================
 
 # Immutable release written by publish_gcs_release.sh.
-GCS_RELEASE_URI="${GCS_RELEASE_URI:-gs://YOUR_BUCKET/qwen-sort/dense20-noqa-resume3000/v1}"
+GCS_RELEASE_URI="${GCS_RELEASE_URI:-gs://qwenfiles/qwen-sort/dense20-noqa-resume3000/v1}"
+
+# The published qwenfiles release is anonymously readable. True uses an isolated
+# Cloud SDK configuration and never asks for Google login/project configuration.
+# Set False only when using a private mirror plus one of the credential options below.
+GCS_PUBLIC_READ="${GCS_PUBLIC_READ:-True}"
 
 # IMPORTANT: use shared high-capacity storage visible from login and compute nodes.
 # Do not use /tmp or a small home quota. The reviewed retention policy needs >=340 GiB.
@@ -111,6 +116,21 @@ ensure_gcloud() {
 }
 
 authenticate_gcs() {
+  case "${GCS_PUBLIC_READ,,}" in
+    true|1|yes)
+      # Do not modify or depend on the user's normal gcloud configuration.
+      export CLOUDSDK_CONFIG="$WORK_ROOT/gcloud-public-anonymous"
+      mkdir -p "$CLOUDSDK_CONFIG"
+      gcloud config set auth/disable_credentials True >/dev/null
+      gcloud storage ls "$GCS_RELEASE_URI/release-manifest.json" >/dev/null || \
+        fail "cannot anonymously read release marker: $GCS_RELEASE_URI/release-manifest.json"
+      note "Anonymous public GCS access: PASS (no Google login required)"
+      return
+      ;;
+    false|0|no) ;;
+    *) fail "GCS_PUBLIC_READ must be True or False, got: $GCS_PUBLIC_READ" ;;
+  esac
+
   if [[ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
     [[ -r "$GOOGLE_APPLICATION_CREDENTIALS" ]] || \
       fail "cannot read GOOGLE_APPLICATION_CREDENTIALS=$GOOGLE_APPLICATION_CREDENTIALS"
@@ -223,8 +243,30 @@ print(p["git_commit"], p["release_id"])
 PY
   )
   local_commit="$(git -C "$REPO_DIR" rev-parse HEAD)"
-  [[ "$release_commit" == "$local_commit" ]] || \
-    fail "code/release mismatch: git HEAD=$local_commit, GCS requires $release_commit"
+  if [[ "$release_commit" != "$local_commit" ]]; then
+    git -C "$REPO_DIR" cat-file -e "$release_commit^{commit}" 2>/dev/null || \
+      fail "release commit is absent from this clone: $release_commit"
+    git -C "$REPO_DIR" merge-base --is-ancestor "$release_commit" "$local_commit" || \
+      fail "release commit $release_commit is not an ancestor of git HEAD=$local_commit"
+    local training_release_paths=(
+      qwenvl/action_expert/human_prompt.py
+      qwenvl/action_expert/modeling_qwen3vl_with_expert.py
+      qwenvl/data/robot_data.py
+      qwenvl/data/subtask_formats_sort.py
+      qwenvl/train/expert_ema.py
+      qwenvl/train/train_action_expert.py
+      scripts/sort_0827_ball_data.sh
+      scripts/train_action_expert_4b_humanprompt.sh
+      scripts/train_action_expert_4b_sort_0827_ball.sh
+      scripts/train_action_expert_4b_sort_0827_ball_dense20_fresh_no_robot_qa_4h100.sh
+      portable/requirements-h100-cu124.txt
+      tests/smoke_test_standalone_pick_action_only.py
+    )
+    git -C "$REPO_DIR" diff --quiet "$release_commit" "$local_commit" -- \
+      "${training_release_paths[@]}" || \
+      fail "training code differs from release commit $release_commit"
+    note "Bootstrap is newer than the release; training-relevant files still match $release_commit"
+  fi
   [[ "$manifest_release" == "$RELEASE_ID" ]] || \
     fail "unexpected release_id=$manifest_release (expected $RELEASE_ID)"
 }

@@ -41,6 +41,10 @@ def main() -> None:
     assert "--inside-slurm" in bootstrap and "sbatch" in bootstrap
     assert "SLURM_GPU_ARGUMENT" in bootstrap
     assert "GOOGLE_APPLICATION_CREDENTIALS" in bootstrap
+    assert 'GCS_PUBLIC_READ="${GCS_PUBLIC_READ:-True}"' in bootstrap
+    assert "auth/disable_credentials True" in bootstrap
+    assert "Anonymous public GCS access: PASS" in bootstrap
+    assert "gs://qwenfiles/qwen-sort/dense20-noqa-resume3000/v1" in bootstrap
 
     # Exact four-GPU resume rather than a weights-only warm start.
     assert 'CHECKPOINT_NAME="checkpoint-3000"' in bootstrap
@@ -53,6 +57,8 @@ def main() -> None:
     assert "export NUM_WORKERS=4" in bootstrap
     assert "export SAVE_TOTAL_LIMIT=2" in bootstrap
     assert "standalone_pick_action_only.py" in bootstrap
+    assert "training_release_paths" in bootstrap
+    assert 'diff --quiet "$release_commit" "$local_commit"' in bootstrap
 
     # Immutable GCS release is content-addressed and marked complete last.
     assert "SHA256SUMS.assets" in publisher

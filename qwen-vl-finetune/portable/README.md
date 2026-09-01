@@ -34,8 +34,8 @@ in a second 72-GiB archive, and writes `release-manifest.json` last.
 ```bash
 git clone YOUR_GITHUB_REPOSITORY_URL Qwen3-VL
 cd Qwen3-VL
-# Edit only the USER CONFIGURATION block: bucket, WORK_ROOT, W&B key/project,
-# and the clearly marked Slurm values.
+# The public GCS release needs no Google login or project configuration.
+# Edit only WORK_ROOT, W&B key/project, and the clearly marked Slurm values.
 bash qwen-vl-finetune/portable/bootstrap_and_submit_4h100_noqa_resume3000.sh
 ```
 
@@ -56,7 +56,9 @@ export WANDB_ENTITY='your-user-or-team'   # optional
 export WANDB_PROJECT='qwen-dense20-noqa'
 ```
 
-For GCS, either authenticate `gcloud` interactively or point
-`GOOGLE_APPLICATION_CREDENTIALS` at a read-only service-account JSON outside the git
-checkout. The bootstrap unsets the W&B key before Slurm submission after W&B stores the
-login in the user's home credentials.
+The default `GCS_PUBLIC_READ=True` uses an isolated anonymous Cloud SDK configuration,
+so the public release requires neither `gcloud init` nor Google login. For a future
+private mirror, set `GCS_PUBLIC_READ=False` and either authenticate interactively or
+point `GOOGLE_APPLICATION_CREDENTIALS` at a read-only service-account JSON outside the
+git checkout. The bootstrap unsets the W&B key before Slurm submission after W&B stores
+the login in the user's home credentials.
