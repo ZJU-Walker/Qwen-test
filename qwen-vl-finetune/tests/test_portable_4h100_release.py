@@ -32,7 +32,8 @@ def main() -> None:
     requirements = (PORTABLE / "requirements-h100-cu124.txt").read_text()
 
     # User-facing one-script and secret contract.
-    assert "WANDB_API_KEY_HERE" in bootstrap
+    assert 'WANDB_API_KEY="${WANDB_API_KEY:-}"' in bootstrap
+    assert 'read -r -s -p "W&B API key: " WANDB_API_KEY' in bootstrap
     assert "wandb.login" in bootstrap and "verify=True" in bootstrap
     assert "unset WANDB_API_KEY" in bootstrap
     assert "prepare_wandb_run_id" in bootstrap
@@ -100,8 +101,8 @@ printf '%s\n' "$SORT_0827_BALL_ROBOT_DIRS"
     assert "/portable/data/0824_prompting/green_block" in lines[3]
     assert "/portable/data/0827/data_0827_prompting_playdata/ball" in lines[3]
 
-    # Committed files contain placeholders only, never an actual-looking W&B key.
-    assert "WANDB_API_KEY_HERE" in bootstrap
+    # Committed files never contain an actual-looking W&B key.
+    assert "WANDB_API_KEY_HERE" not in bootstrap
     assert not any(
         token.startswith("wandb_api_") or token.startswith("wapi-")
         for token in bootstrap.split()

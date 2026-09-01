@@ -47,8 +47,9 @@ W&B run ID under `WORK_ROOT/wandb/`, so a resubmission appends to the same dashb
 
 ## Credentials
 
-Never commit credentials. `WANDB_API_KEY_HERE` is an explicit placeholder. Prefer an
-environment variable even though editing the local clone is supported:
+Never commit credentials. If `WANDB_API_KEY` is unset, the bootstrap asks for it with a
+private terminal prompt and removes it from the environment before Slurm submission.
+You can also export it before running:
 
 ```bash
 export WANDB_API_KEY='...'

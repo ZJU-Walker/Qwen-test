@@ -26,9 +26,9 @@ GCS_PUBLIC_READ="${GCS_PUBLIC_READ:-True}"
 # Do not use /tmp or a small home quota. The reviewed retention policy needs >=340 GiB.
 WORK_ROOT="${WORK_ROOT:-/scratch/${USER:-user}/qwen_dense20_noqa_resume3000}"
 
-# Paste your key in place of WANDB_API_KEY_HERE, or preferably export WANDB_API_KEY
-# before running this script. Never commit/push the edited key.
-WANDB_API_KEY="${WANDB_API_KEY:-WANDB_API_KEY_HERE}"
+# Leave this empty. The login-node bootstrap prompts privately when WANDB_API_KEY
+# is not already exported; the key is never written into this script or Slurm env.
+WANDB_API_KEY="${WANDB_API_KEY:-}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"  # optional: username/team; empty uses account default
 WANDB_PROJECT="${WANDB_PROJECT:-qwen-dense20-noqa}"
 # Leave empty to create a new W&B run whose first logged trainer step is 3001.
@@ -195,8 +195,11 @@ PY
 }
 
 login_wandb() {
-  if [[ "$WANDB_API_KEY" == "WANDB_API_KEY_HERE" || -z "$WANDB_API_KEY" ]]; then
-    fail "replace WANDB_API_KEY_HERE in the USER CONFIGURATION block or export WANDB_API_KEY"
+  if [[ -z "$WANDB_API_KEY" ]]; then
+    [[ -t 0 ]] || fail "WANDB_API_KEY is unset and no interactive terminal is available"
+    read -r -s -p "W&B API key: " WANDB_API_KEY
+    echo
+    [[ -n "$WANDB_API_KEY" ]] || fail "W&B API key cannot be empty"
   fi
   note "Logging in to Weights & Biases (the key will not be printed)..."
   WANDB_API_KEY="$WANDB_API_KEY" "$ENV_PREFIX/bin/python" - <<'PY'
