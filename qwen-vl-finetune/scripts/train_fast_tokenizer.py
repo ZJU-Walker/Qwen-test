@@ -34,6 +34,7 @@ import pandas as pd
 
 from qwenvl.data.robot_data import (
     compute_norm_stats,
+    load_train_exclude_episodes,
     make_action_chunk,
     make_delta_mask,
     parse_active_dims,
@@ -43,7 +44,7 @@ from qwenvl.data.robot_data import (
 
 def scan_state_actions(robot_data_dirs: str, active_dims, train_split: float,
                        action_space: str = "joint", min_episode_len: int = 0,
-                       skip_leading_subtask: str = ""):
+                       skip_leading_subtask: str = "", exclusion_fingerprint_out=None):
     """Load (states, actions) per episode. No video needed for tokenizer fitting.
 
     DAgger episodes (an `is_intervention` parquet column) get `min_start` = the first
@@ -63,13 +64,29 @@ def scan_state_actions(robot_data_dirs: str, active_dims, train_split: float,
         if not root.exists():
             print(f"skipping missing root {root}")
             continue
+        chunk_dirs = sorted((root / "data").glob("chunk-*"))
+        known_episode_names = {
+            pq.stem + ".mp4"
+            for chunk_dir in chunk_dirs
+            for pq in chunk_dir.glob("episode_*.parquet")
+        }
+        excluded = load_train_exclude_episodes(root, known_episode_names)
+        if excluded:
+            if exclusion_fingerprint_out is not None:
+                exclusion_fingerprint_out[str(root)] = sorted(excluded)
+            print(
+                f"{root.name}: skipping {len(excluded)} episode(s) from "
+                "meta/train_exclude_episodes.json"
+            )
         subtask_labels = {}
         for labels_path in sorted((root / "videos").glob("chunk-*/subtask_labels.json")):
             with open(labels_path) as f:
                 subtask_labels.update(json.load(f))
         per_root = []
-        for chunk_dir in sorted((root / "data").glob("chunk-*")):
+        for chunk_dir in chunk_dirs:
             for pq in sorted(chunk_dir.glob("episode_*.parquet")):
+                if pq.stem + ".mp4" in excluded:
+                    continue
                 has_iv = "is_intervention" in papq.read_schema(pq).names
                 df = pd.read_parquet(
                     pq, columns=["observation.state", "action"] + (["is_intervention"] if has_iv else [])
@@ -133,9 +150,10 @@ def main():
     active_dims = parse_active_dims(args.active_dims)
     delta_mask = make_delta_mask(args.delta_mask) if args.use_delta_actions else None
 
+    train_exclusions = {}
     episodes = scan_state_actions(args.robot_data_dirs, active_dims, args.train_split,
                                   args.action_space, args.min_episode_len,
-                                  args.skip_leading_subtask)
+                                  args.skip_leading_subtask, train_exclusions)
     if not episodes:
         raise ValueError(f"No episodes under {args.robot_data_dirs}")
     print(f"scanned {len(episodes)} episodes")
@@ -170,6 +188,8 @@ def main():
             "robot_data_dirs": args.robot_data_dirs,
             "train_split": args.train_split,
         }
+        if train_exclusions:
+            norm_stats["meta"]["train_exclude_episodes"] = train_exclusions
         if args.action_space != "joint":
             norm_stats["meta"]["action_space"] = args.action_space
         if args.min_episode_len:

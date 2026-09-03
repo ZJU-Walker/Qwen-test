@@ -1799,23 +1799,11 @@ class RobotFlowMatchingDataset(Dataset):
             task_text = self.data_args.subtask_question
             assistant_text = self._fmt.standalone_pick_answer("phase", tasks)
         elif standalone_robot_qa:
-            # Robot-only visual grounding: ball is never placed in the human-prompt
-            # channel.  Initial-scene questions use frame zero; outcome questions use
-            # the full sparse cam_high demonstration (selected below).
+            # Robot-only visual grounding: these pick-only roots have no matching
+            # human-prompt clip. Initial-scene questions use frame zero; outcome
+            # questions use the full sparse cam_high demonstration (selected below).
             tasks = [segment["task"] for segment in episode["subtasks"]]
-            object_answer = self._fmt.standalone_pick_answer("object", tasks)
-            phase_answer = self._fmt.standalone_pick_answer("phase", tasks)
-            qa_specs = (
-                ("initial", "What object is currently on the table?", object_answer),
-                (
-                    "initial",
-                    f"Given the task is to pick up the {object_answer}, what should "
-                    "the robot do next?",
-                    phase_answer,
-                ),
-                ("full", "What object did the robot pick up?", object_answer),
-                ("full", "What skill did the robot demonstrate?", phase_answer),
-            )
+            qa_specs = self._fmt.standalone_pick_qa_specs(tasks)
             robot_qa_visual, task_text, assistant_text = qa_specs[robot_qa_choice]
         elif self.data_args.predict_subtask:
             if self._qa_mix is not None:

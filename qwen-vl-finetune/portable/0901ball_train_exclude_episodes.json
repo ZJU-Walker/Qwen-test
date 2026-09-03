@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "reason": "Manual cam-high QC: episode 8 contains a regrasp plus human intervention; episode 11 reopens and leaves the ball on the table.",
+  "episodes": [
+    "episode_000008.mp4",
+    "episode_000011.mp4"
+  ]
+}

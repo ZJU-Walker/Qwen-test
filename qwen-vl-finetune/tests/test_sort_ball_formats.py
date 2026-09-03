@@ -19,6 +19,7 @@ from qwenvl.data.subtask_formats_sort import (  # noqa: E402
     key_at,
     phase_context,
     standalone_pick_answer,
+    standalone_pick_qa_specs,
     where_answer,
     where_objects,
     where_question,
@@ -62,6 +63,26 @@ def test_action_vocabulary_and_standalone_contract():
         must_raise(standalone_pick_answer, fmt, BALL_PICK)
 
 
+def test_standalone_qa_is_generic_and_destination_free():
+    cases = {
+        "ball": ("ball", "pick ball"),
+        "green block": ("green", "pick green"),
+        "grey box": ("grey", "pick grey"),
+    }
+    for full_name, (obj, phase) in cases.items():
+        specs = standalone_pick_qa_specs([f"pick up the {full_name}"])
+        assert [visual for visual, _, _ in specs] == [
+            "initial", "initial", "full", "full"
+        ]
+        assert [answer for _, _, answer in specs] == [obj, phase, obj, phase]
+        joined_questions = " ".join(question for _, question, _ in specs)
+        assert f"pick up the {full_name}" in joined_questions
+        assert not any(
+            destination in joined_questions.lower()
+            for destination in ("left", "middle", "right", "tray")
+        )
+
+
 def test_complete_pair_apis_still_require_a_destination():
     # Standalone data must not receive a human-prompt key or a fabricated target.
     must_raise(phase_context, BALL_PICK, 0)
@@ -90,6 +111,7 @@ def test_ball_is_not_a_negative_only_where_candidate():
 
 if __name__ == "__main__":
     test_action_vocabulary_and_standalone_contract()
+    test_standalone_qa_is_generic_and_destination_free()
     test_complete_pair_apis_still_require_a_destination()
     test_ball_is_not_a_negative_only_where_candidate()
     print("PASS: standalone ball format contract")

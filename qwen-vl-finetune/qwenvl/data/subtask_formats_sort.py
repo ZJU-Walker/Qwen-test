@@ -207,6 +207,48 @@ def standalone_pick_answer(fmt: str, tasks: Sequence[str]) -> str:
     raise ValueError(f"unknown sorting QA format {fmt!r}")
 
 
+def standalone_pick_qa_specs(
+    tasks: Sequence[str],
+) -> Tuple[Tuple[str, str, str], ...]:
+    """Truthful visual-QA records for a destination-free pickup episode.
+
+    Each tuple is ``(visual_source, question, compressed_answer)``.  Initial
+    questions use the first robot view; full questions use the complete sparse
+    robot demonstration.  The natural-language task in question two uses the
+    full object name (``green block`` / ``grey box``), while answers retain the
+    compact vocabulary used by the ordinary sorting QA stream.
+
+    No question asks where the object goes: standalone recordings contain no
+    transport, destination, or release evidence.
+    """
+    obj = _standalone_pick_object(tasks)
+    full_name = SYMBOL_NAME[obj]
+    phase = f"pick {obj}"
+    return (
+        (
+            "initial",
+            "What object is available for the robot to pick up?",
+            obj,
+        ),
+        (
+            "initial",
+            f"Given the task is to pick up the {full_name}, what should the "
+            "robot do next?",
+            phase,
+        ),
+        (
+            "full",
+            "What object did the robot pick up in this demonstration?",
+            obj,
+        ),
+        (
+            "full",
+            "What pickup skill did the robot demonstrate?",
+            phase,
+        ),
+    )
+
+
 def phase_context(tasks: Sequence[str], idx: int) -> Tuple[str, str, str]:
     """(phase, object symbol, destination) for segment idx. Segments must alternate
     pick, move, ...: the factor a segment's own string omits (the pick's destination,
